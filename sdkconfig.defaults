@@ -1,0 +1,65 @@
+# ==================== Target ====================
+CONFIG_IDF_TARGET="esp32s3"
+
+# ==================== Flash (onboard W25Q128 = 16MB) ====================
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# ==================== PSRAM (8MB Octal) ====================
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# ==================== CPU ====================
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ==================== FreeRTOS ====================
+CONFIG_FREERTOS_HZ=1000
+# Main task stack: default is 3584 B. Our boot path (esp_console + LVGL object
+# tree + deep ESP_LOGI format paths) runs in app_main's context, so give it
+# room. If this is too small the board resets silently during startup.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ==================== Console / Log ====================
+# IMPORTANT: this board talks to the PC over the ESP32-S3's **native
+# USB-Serial-JTAG** peripheral (Windows enumerates it as "USB JTAG/serial debug
+# unit"). UART0 (GPIO43/44) is only routed to the expansion header and is NOT
+# wired to the Type-C port.
+#
+# Keeping the console on UART0 produces a board that boots perfectly, prints
+# nothing, and looks completely dead -- the ROM console is happily writing into
+# unconnected pins. So: primary console = USB-Serial-JTAG.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ==================== LVGL ====================
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_COLOR_16_SWAP=y
+CONFIG_LV_DISP_DEF_REFR_PERIOD=10
+CONFIG_LV_INDEV_DEF_READ_PERIOD=10
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEMCPY_MEMSET_STD=y
+CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+CONFIG_LV_USE_PERF_MONITOR=y
+
+# LVGL fonts
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_MONTSERRAT_40=y
+
+# LVGL examples: the examples/ and demos/ directories were removed from
+# components/lvgl to slim the repository (67 MB of unused sample assets).
+# Keep this OFF so the build never tries to glob them.
+CONFIG_LV_BUILD_EXAMPLES=n
+
+# ==================== Partition table ====================
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

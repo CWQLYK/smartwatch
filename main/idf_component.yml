@@ -1,0 +1,8 @@
+## IDF Component Manager Manifest File
+##
+## 注意：LVGL / esp_lvgl_port / esp_lcd_touch 已本地化到工程根目录的 components/ 下，
+## 不再通过组件管理器下载（回避 ESP-IDF 5.5 组件管理器 Kconfig 解析问题）。
+## 编译时请设置 IDF_COMPONENT_MANAGER=0
+dependencies:
+  idf:
+    version: ">=5.5.0"

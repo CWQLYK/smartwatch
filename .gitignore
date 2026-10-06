@@ -1,0 +1,30 @@
+# ============================================================
+#  智能手表固件 — 忽略规则
+#  （这个仓库的根就是 firmware/smartwatch）
+# ============================================================
+
+# ---- ESP-IDF 构建产物 ----
+build/
+sdkconfig
+sdkconfig.old
+
+# 组件管理器（本项目已把组件本地化到 components/，不用它）
+managed_components/
+dependencies.lock
+
+# ---- PC 模拟器 / 主机侧测试的产物 ----
+# lvgl_sim 的 Makefile 会直接在固件源码目录里生成 .o，
+# 一定要忽略，否则会把 MinGW 的目标文件混进 ESP-IDF 工程。
+**/*.o
+**/*.obj
+**/*.exe
+
+# ---- 编辑器里的本机配置 ----
+# settings.json 里是绝对路径 + 本机串口号，不适合共享；
+# 如果以后要统一 VSCode 行为，可以把公共部分放进 *.code-workspace 再提交。
+.vscode/settings.json
+
+# ---- 系统文件 ----
+Thumbs.db
+desktop.ini
+.DS_Store
