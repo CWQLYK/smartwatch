@@ -7,6 +7,6 @@
 idf_component_register(
     SRCS "motion.c"
     INCLUDE_DIRS "include"
-    REQUIRES imu data_hub settings
+    REQUIRES imu imu_logger data_hub settings
     PRIV_REQUIRES esp_timer event_bus
 )

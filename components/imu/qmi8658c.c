@@ -183,28 +183,69 @@ void step_counter_init(step_counter_t *sc, const step_config_t *cfg)
          *   4. cadence band + rhythm_cv_x1000     误计抑制
          * ---------------------------------------------------- */
         sc->cfg.sample_rate_hz     = 50;
-        /* 60mg 绝对地板：实测低于这个值打字/小幅乱动会大量误计。
-         * 真实腕部走路冲击通常 150–600mg，余量足够。 */
-        sc->cfg.peak_thresh_mg     = 60;
+        /*
+         * ============================================================
+         * 下面这组值是**用真实腕部数据**重新标定的（v0.4.1）
+         * ============================================================
+         *
+         * 原来的值是用"合成腕部运动模型"扫出来的，作者当时就标注了
+         * "上板前不要信"。第一份真实数据（50 步 / 74 步每分）一跑，
+         * 输出 **0 步** —— 完全不能用。排查结论：
+         *
+         *   1) **波峰因数门（crest）是主要元凶**。
+         *      它假设步态是"脉冲型冲击"，靠"峰值 ≥ 2σ"筛掉平滑摆动。
+         *      但真实腕部在 74 步每分（1.23Hz，正好落在带通中心）时，
+         *      信号是一个很强但**平滑的正弦**：
+         *          |bp| 均值 120 Q10、p95 = 300、峰值 545
+         *      信噪比其实很好，问题是 σ≈146 和 |bp| 均值同量级，
+         *      于是 peak/σ 只有 1.5~3.7，**永远过不了 2.0 这一关**，
+         *      444/475 个真实峰被拒。所以这里把它**关掉**（=0），
+         *      改用"不应期 + 步频范围 + 节律一致性"来压误计。
+         *
+         *   2) **不应期必须加大到 400ms**。
+         *      原始 250ms 太小：平滑信号配合贴着信号走的自适应门限，
+         *      会在一步内反复穿越、报出多个峰。实测原始 92 个峰里，
+         *      有 57 个间隔落在 100~400ms（一步双检），
+         *      而真实步间隔在 700~1200ms。400ms 正好把双检挡掉、
+         *      又留给快步（150 步每分 = 400ms 周期）。
+         *
+         *   3) **步频下限放宽到 50**：用户实测 74 步每分，
+         *      原来的 60 下限对慢走太苛刻。
+         *
+         * ## 标定结果（tools/step_eval.py）
+         *
+         *   真实数据：50 步 -> **51 步（+2%）**
+         *   合成交叉检查（60~120 步每分）：最差 **2.1%**（原来 100%）
+         *
+         * ⚠️ 只有一份真实数据，仍有过度拟合风险。
+         *    再录几段不同步频/不同握姿的数据，用
+         *    tools/step_search.py 多文件联合评估会更可靠。
+         */
+        sc->cfg.peak_thresh_mg     = 50;
         sc->cfg.start_thresh_mg    = 60;    /* 进入门限（>= 地板） */
         sc->cfg.end_thresh_mg      = 25;    /* 退出门限（滞回下沿） */
         sc->cfg.sigma_mul_x100     = 30;    /* thr = 包络 + 0.30σ */
-        sc->cfg.crest_min_x100     = 200;   /* 峰值 ≥ 2.0σ */
+        /*
+         * 波峰因数门：0 = 关闭。
+         * 真实腕部信号是平滑正弦而非脉冲，这个门会把真实步全拒掉。
+         * 详见上面第 1 条。
+         */
+        sc->cfg.crest_min_x100     = 0;
         sc->cfg.peak_rel_pct       = 0;     /* 关闭（需真实数据定标） */
-        sc->cfg.refractory_pct     = 35;    /* 最小间隔 = 35% 步周期 */
-        sc->cfg.refractory_ms      = 250;   /* 绝对下限（约 240 步/分） */
+        /* 不应期：400ms 挡住"一步双检"，又留给 150 步每分的快步 */
+        sc->cfg.refractory_pct     = 45;
+        sc->cfg.refractory_ms      = 400;
         sc->cfg.strong_step_ms     = 0;     /* 关闭（与不应期重叠） */
         sc->cfg.strong_peak_mg     = 100000;
         sc->cfg.reversal_pct       = 35;    /* 回落 35% 确认峰 */
-        sc->cfg.peak_timeout_ms    = 400;
         sc->cfg.adaptive_reset_ms  = 1800;
         sc->cfg.rhythm_window      = 5;
-        sc->cfg.rhythm_cv_x1000    = 260;   /* CV ≤ 0.26 */
+        sc->cfg.rhythm_cv_x1000    = 700;   /* CV <= 0.70（真实数据标定，见上方说明） */
         /* commit_after 决定“起步要丢掉几步才确认节律”。取 4 时每段走路
          * 开头会丢约 5 步，多段短走（走走停停）会明显少计；取 3 兼顾
          * 误计抑制与漏计，实测 60s 走路误差约 -6%。 */
         sc->cfg.commit_after       = 3;
-        sc->cfg.cadence_min_spm    = 60;
+        sc->cfg.cadence_min_spm    = 50;   /* 放宽到 50：实测 74 步每分，原来的 60 对慢走太苛刻 */
         sc->cfg.cadence_max_spm    = 230;
         sc->cfg.user_height_cm     = 170;
         sc->cfg.user_weight_kg     = 65;
@@ -659,6 +700,16 @@ esp_err_t qmi8658_enable_gyro(bool en)
 esp_err_t qmi8658_read_status0(uint8_t *status0)
 {
     return reg_read(QMI8658_REG_STATUS0, status0, 1);
+}
+
+/**
+ * @brief 直接读一个寄存器（调试/自检用，见头文件说明）
+ */
+esp_err_t qmi8658_read_reg_raw(uint8_t reg, uint8_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    return reg_read(reg, out, 1);
 }
 
 esp_err_t qmi8658_read(qmi8658_sample_t *out)

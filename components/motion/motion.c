@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "qmi8658c.h"
+#include "imu_logger.h"
 #include "data_hub.h"
 #include "settings.h"
 
@@ -100,11 +101,75 @@ static void motion_task(void *arg)
             qmi8658_accel_raw_to_mg(smp.az, MOTION_AFS),
         };
 
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        /*
+         * 原始数据同步喂给录制器（离线调参用）。
+         * 没在录制时 imu_logger_feed() 内部第一行就返回，开销可以忽略。
+         */
+        imu_logger_feed(now_ms, accel_mg);
+
         if (s_lock) {
             xSemaphoreTake(s_lock, portMAX_DELAY);
         }
-        step_counter_update(&s_sc, accel_mg,
-                            (uint32_t)(esp_timer_get_time() / 1000));
+        /*
+         * 静止自检（开机后只跑一次，统计 200 帧约 4 秒）：
+         * 打印合矢量 |a| 的中位数和范围。**静止时中位数应在 1000 mg 左右**。
+         *
+         * ⚠️ 两个坑都踩过，别再改回去：
+         *
+         * 1. **必须丢掉开头一段样本**（这里丢前 100 帧 = 2 秒）。
+         *    加速度计的 LPF 是 ODR 的 2.66%（62.5Hz 下约 1.66Hz），
+         *    上电后要 1 秒左右才稳定；再加上开机时手在动、板子在晃。
+         *    不丢的话读到的是过渡过程，实测打出 586 mg，
+         *    看着像"只有 0.6g"，害我去怀疑量程 —— 白查了半天。
+         *
+         * 2. **用中位数而不是平均值**：搬运/碰桌子造成的个别大值
+         *    会把平均值拉偏，中位数不受影响。
+         */
+        static int32_t gbuf[100];
+        static int     gcnt = 0;
+        if (gcnt < 200) {
+            const int64_t s2 = (int64_t)accel_mg[0] * accel_mg[0] +
+                               (int64_t)accel_mg[1] * accel_mg[1] +
+                               (int64_t)accel_mg[2] * accel_mg[2];
+            /* 整数牛顿迭代开方，避免拉进浮点库 */
+            int32_t r = (int32_t)s2, x = r, y = 1;
+            while (x > y) { x = (x + y) / 2; y = r / x; }
+
+            /* 只保留后 100 帧（丢掉启动过渡） */
+            if (gcnt >= 100) {
+                gbuf[gcnt - 100] = x;
+            }
+            gcnt++;
+
+            if (gcnt == 200) {
+                /* 插入排序求中位数（100 个元素，开销可忽略且只跑一次） */
+                for (int i = 1; i < 100; i++) {
+                    const int32_t key = gbuf[i];
+                    int j = i - 1;
+                    while (j >= 0 && gbuf[j] > key) {
+                        gbuf[j + 1] = gbuf[j];
+                        j--;
+                    }
+                    gbuf[j + 1] = key;
+                }
+                const int32_t med = gbuf[50];
+                /*
+                 * 容差 ±10%：板子斜一点、桌子有点坡度都会让 |a| 偏离 1g，
+                 * 但那是**姿态**造成的，不是换算错了。真正的换算错误
+                 * 是整体偏倍（比如 500 或 2000），一眼就能看出来。
+                 */
+                const bool ok = (med > 900 && med < 1100);
+                ESP_LOGI(TAG, "静止 |a|：中位 %" PRId32 " mg，范围 %" PRId32 "..%" PRId32
+                              " mg  %s",
+                         med, gbuf[0], gbuf[99],
+                         ok ? "正常（约 1g）"
+                            : "**偏离 1g！先查量程换算再调计步参数**");
+            }
+        }
+
+        step_counter_update(&s_sc, accel_mg, now_ms);
         if (s_lock) {
             xSemaphoreGive(s_lock);
         }
@@ -191,6 +256,26 @@ esp_err_t motion_init(void)
      *    steps.available 一直是 false → 界面显示占位符。
      *    第一次推送之后 available 才变 true，界面才开始显示 "0"。
      */
+    /*
+     * 量程自检：把 CTRL2 读回来，确认 aFS 真的写进去了。
+     *
+     * 为什么要查：raw -> mg 的换算是 raw * 1000 / (32768 >> aFS)，
+     * **完全依赖量程**。若芯片实际是 ±16g 而按 ±8g 换算，
+     * 所有加速度会整体偏一倍；而计步门限、带通系数全是按 mg 定的，
+     * 表现成"参数怎么调都不对"，却很难想到是量程问题。
+     */
+    {
+        uint8_t ctrl2 = 0;
+        if (qmi8658_read_reg_raw(QMI8658_REG_CTRL2, &ctrl2) == ESP_OK) {
+            const uint8_t afs = (ctrl2 >> 4) & 0x07;
+            ESP_LOGI(TAG, "加速度计 CTRL2=0x%02X（量程 ±%dg，aFS=%d；期望 aFS=%d）%s",
+                     ctrl2, 2 << afs, (int)afs, (int)MOTION_AFS,
+                     (afs == (int)MOTION_AFS) ? "" : "  <<< 量程不一致！");
+        } else {
+            ESP_LOGW(TAG, "读不回 CTRL2，无法确认量程");
+        }
+    }
+
     data_hub_set_steps(0, 0, 0);
 
     if (xTaskCreate(motion_task, "motion", MOTION_TASK_STACK, NULL,

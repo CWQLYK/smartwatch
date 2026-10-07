@@ -29,6 +29,29 @@ static bool                    s_time_lost = true;   /* 保守：默认认为不
 /* 2000-01-01 00:00:00 UTC 对应的 Unix 时间戳 */
 #define RTC_EPOCH_2000  946684800UL
 
+/*
+ * 2000-01-01 相对 1970-01-01 的天数。
+ *
+ * ⚠️ 这个常量是为了修一个**差了整整 30 年**的 bug，务必看清楚再动：
+ *
+ *   `civil_from_days()` / `days_from_civil()` 里的 719468 是按
+ *   **1970-01-01 起的天数**写的（Howard Hinnant 的原始算法）。
+ *   但 RTC 芯片只能存 2000 年以后的年份，所以 `rtc_pcf_set_epoch()`
+ *   算出来的是"**相对 2000**的天数"，直接喂进去就少了 10957 天 = 30 年。
+ *
+ *   实测症状：SNTP 对时拿到 2026-10-07 的 epoch，写进 RTC 却变成
+ *   1996-10-07，然后被 `rtc_pcf_set_time()` 的合法性检查拒掉：
+ *       E RTC: 时间字段非法: 1996-10-07 08:51:46
+ *       E DATA_HUB: 写 RTC 失败
+ *
+ *   为什么之前测试没发现：`rtc_pcf_get_epoch()` 回读时**也**偏了 30 年，
+ *   两个错误互相抵消，所以"写进去再读出来"看着是对的。
+ *   只有拿**真实 epoch**去写、或用别的途径核对日期时才会暴露。
+ *
+ *   改的时候注意：**set 要加、get 要减**，两边必须成对。
+ */
+#define DAYS_1970_TO_2000  10957
+
 /* ==================== BCD 转换 ==================== */
 static inline uint8_t bcd2bin(uint8_t bcd) { return (uint8_t)((bcd >> 4) * 10 + (bcd & 0x0F)); }
 static inline uint8_t bin2bcd(uint8_t bin) { return (uint8_t)(((bin / 10) << 4) | (bin % 10)); }
@@ -225,7 +248,14 @@ esp_err_t rtc_pcf_set_epoch(uint32_t epoch_sec)
                         "时间戳 %" PRIu32 " 早于 2000-01-01，RTC 芯片存不下",
                         epoch_sec);
 
-    int32_t days = (int32_t)((epoch_sec - RTC_EPOCH_2000) / 86400UL);
+    /*
+     * ★ 注意 + DAYS_1970_TO_2000：
+     *   这里算出来的是"相对 2000 的天数"，而 civil_from_days() 要的是
+     *   "相对 1970 的天数"。两者差 10957 天。漏掉就是差 30 年
+     *   （详见 DAYS_1970_TO_2000 的注释）。
+     */
+    int32_t days = (int32_t)((epoch_sec - RTC_EPOCH_2000) / 86400UL)
+                   + DAYS_1970_TO_2000;
     uint32_t rem = (uint32_t)((epoch_sec - RTC_EPOCH_2000) % 86400UL);
 
     rtc_pcf_time_t t;
@@ -248,7 +278,9 @@ uint32_t rtc_pcf_get_epoch(void)
         return 0;
     }
 
-    const int32_t days = days_from_civil(t.year, t.month, t.day);
+    /* ★ 减掉 DAYS_1970_TO_2000，和 rtc_pcf_set_epoch() 里的加法成对（见那个宏的注释） */
+    const int32_t days = days_from_civil(t.year, t.month, t.day)
+                         - DAYS_1970_TO_2000;
     return (uint32_t)((int64_t)days * 86400LL +
                       t.hour * 3600 + t.minute * 60 + t.second + RTC_EPOCH_2000);
 }

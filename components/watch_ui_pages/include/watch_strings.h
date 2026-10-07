@@ -15,6 +15,17 @@
  */
 #pragma once
 
+/* ==================== 字库补字（只为让生成脚本扫到） ====================
+ *
+ * 这个宏**不在界面上显示**，目的是把"只出现在 app 层日志/提示里"的汉字
+ * 也纳入字库扫描范围（生成脚本只扫字符串字面量，
+ * 而 watch_strings.h 的中文一律会被收进去）。
+ *
+ * 为什么需要：串口命令行和启动日志里的中文也要能正常显示 ——
+ * 它们用的是同一套字库。漏了就是豆腐块（本项目踩过多次）。
+ * ================================================================== */
+#define W_STR_FONT_EXTRA  "提示凭"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -99,6 +110,74 @@ extern "C" {
 #define W_STR_STEP_GOAL     "步数目标"
 #define W_STR_USER_HEIGHT   "身高"
 #define W_STR_USER_WEIGHT   "体重"
+
+/* ==================== 开发人员选项 ==================== */
+#define W_STR_DEV_TITLE        "开发人员选项"
+#define W_STR_DEV_IMU_REC      "IMU 录制"
+#define W_STR_DEV_IMU_REC_SUB  "录真实走路数据，回来导出调参"
+#define W_STR_DEV_TIME_SET     "时间校准"
+#define W_STR_DEV_TIME_SET_SUB "手动设置 UTC 时间"
+#define W_STR_DEV_SYSINFO      "系统信息"
+#define W_STR_DEV_SYSINFO_SUB  "内存 / 固件 / 存储"
+#define W_STR_DEV_HINT         "这些是给开发调试用的功能，普通使用不需要进来。"
+
+/* ==================== IMU 录制页 ==================== */
+#define W_STR_REC_START       "开始录制"
+#define W_STR_REC_STOP        "停止录制"
+#define W_STR_REC_ERASE       "删除全部日志"
+#define W_STR_REC_IDLE        "空闲"
+#define W_STR_REC_RECORDING   "录制中…"
+#define W_STR_REC_UNAVAILABLE "存储不可用，无法录制"
+#define W_STR_REC_FRAMES      "帧"
+#define W_STR_REC_SECONDS     "秒"
+#define W_STR_REC_FILES       "已有日志"
+#define W_STR_REC_COUNT_SUF   "个"
+#define W_STR_REC_CAPACITY    "存储"
+#define W_STR_REC_TIP         "走完先点【停止录制】再拔线，否则会丢一点数据。录制期间不会自动息屏。"
+
+/* ==================== 时间校准页 ==================== */
+#define W_STR_TIME_UTC_HINT "本页设置的是 UTC 时间（不是本地时间）。表盘显示时会按设备时区换算。"
+#define W_STR_TIME_APPLY    "写入时间"
+
+/* ==================== 系统信息页 ==================== */
+#define W_STR_INFO_FW       "固件版本"
+#define W_STR_INFO_HEAP     "空闲内存"
+#define W_STR_INFO_PSRAM    "PSRAM"
+#define W_STR_INFO_UPTIME   "已运行"
+#define W_STR_INFO_STORAGE  "存储占用"
+
+/* ==================== WiFi 页 ==================== */
+#define W_STR_WIFI_TITLE        "WiFi 连接"
+#define W_STR_WIFI_SCAN         "扫描附近网络"
+#define W_STR_WIFI_SCANNING     "扫描中…"
+#define W_STR_WIFI_SCAN_TIMEOUT "扫描超时，点下面重新扫"
+#define W_STR_WIFI_SCAN_DONE    "选一个网络连接"
+#define W_STR_WIFI_RESCAN       "重新扫描"
+#define W_STR_WIFI_CANCEL       "取消连接"
+#define W_STR_WIFI_CONNECTING_TIP "连上后会自动校准时间。"
+#define W_STR_WIFI_PICK_AP      "点一个网络连接"
+#define W_STR_WIFI_NO_AP        "没扫到网络，点上面重新扫描"
+#define W_STR_WIFI_UNAVAILABLE  "WiFi 不可用（请看串口日志）"
+#define W_STR_WIFI_PASSWORD     "输入 WiFi 密码"
+#define W_STR_WIFI_CONNECTING   "连接中…"
+#define W_STR_WIFI_CONNECTED    "已连接"
+#define W_STR_WIFI_FAILED       "连接失败（密码错或信号太差）"
+#define W_STR_WIFI_IDLE         "未连接"
+#define W_STR_WIFI_RECONNECTING "正在用已保存的密码重连…"
+#define W_STR_WIFI_DISCONNECT   "断开连接"
+#define W_STR_WIFI_FORGET       "取消保存"
+#define W_STR_WIFI_RESYNC       "重新对时"
+#define W_STR_WIFI_SYNCING      "对时中…"
+#define W_STR_WIFI_SYNC_FAILED  "对时失败"
+#define W_STR_WIFI_SYNCED       "已对时"
+#define W_STR_WIFI_NOT_SYNCED   "未对时"
+#define W_STR_WIFI_STRONG       "强"
+#define W_STR_WIFI_MEDIUM       "中"
+#define W_STR_WIFI_WEAK         "弱"
+#define W_STR_WIFI_LOCK         "[锁]"
+#define W_STR_WIFI_POWER_WARN   "WiFi 已开，耗电较大"
+#define W_STR_WIFI_POWER_HINT   "WiFi 保持连接会比较费电。不用的时候请回到本页点【断开】，可以明显延长续航。"
+#define W_STR_OK                "知道了"
 
 #ifdef __cplusplus
 }

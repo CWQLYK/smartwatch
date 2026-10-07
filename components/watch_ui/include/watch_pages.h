@@ -224,6 +224,14 @@ int watch_ui_debug_scroll_x(void);
 /** @brief 调试用：打印轮播的滚动范围和槽位坐标（查"滑不动"用） */
 void watch_ui_debug_dump(void);
 
+/**
+ * @brief 调试用：当前页能纵向滚多少像素（0 = 内容不满一屏，不会滚）
+ *
+ * 排查"某个按钮在屏幕外够不着"时先看这个数：
+ * 大于 0 说明页面**应该**能滚；如果实际滚不动，问题在拖动处理而不是布局。
+ */
+int watch_ui_debug_page_scroll(void);
+
 /* ==================================================================
  * 四、内置页面（定义在 watch_ui_pages 组件里）
  * ================================================================== */
@@ -314,6 +322,40 @@ int watch_ui_setting_get(const char *key, int def);
 
 /** @brief 写设置项（钩子没接时什么都不做） */
 int watch_ui_setting_set(const char *key, int value);
+
+
+/* ==================================================================
+ * 子页面入口（设置页调用）
+ *
+ * 这些**不是轮播页**，而是盖在轮播上的模态子页（见 watch_modal.h）。
+ * 声明集中放这里，是为了让设置页只 include 一个头文件。
+ * ================================================================== */
+
+/** @brief 打开"开发人员选项"菜单 */
+void watch_developer_open_menu(void);
+
+/**
+ * @brief 取当前 UTC 时间戳（界面层拿时间的唯一途径）
+ *
+ * @return Unix 时间戳；RTC 没校过时返回 0
+ *
+ * @note 界面层不许用 time.h，所以时间统一从这里问。
+ */
+uint32_t watch_ui_current_epoch(void);
+
+/** @brief 打开"WiFi 连接"页 */
+void watch_wifi_open(void);
+
+/**
+ * @brief 由 app 层注入系统信息（界面层拿不到 esp_* API）
+ *
+ * @param fw      固件版本
+ * @param heap    空闲内存（已格式化，如 "8.5 MB"）
+ * @param psram   PSRAM（已格式化）
+ * @param uptime  运行时长（已格式化）
+ */
+void watch_developer_set_sysinfo(const char *fw, const char *heap,
+                                 const char *psram, const char *uptime);
 
 #ifdef __cplusplus
 }

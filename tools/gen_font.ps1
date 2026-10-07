@@ -109,6 +109,14 @@ foreach ($file in $ScanFiles) {
     }
 }
 
+# 显式补充少量"非 CJK 区、但界面真的会显示"的字符。
+# 扫描器的正则是 CJK 区（4E00-9FFF / 3000-303F / FF00-FFEF），
+# 而省略号 U+2026 在"常用标点"区，扫不到 —— 但 WiFi 页的
+# "扫描中…""连接中…" 都会用它，漏了就是豆腐块。
+# 这类字符很少，直接列出来比放宽正则更可控（放宽会把 Emoji 等一大票都吸进来）。
+$ExtraChars = @([char]0x2026)   # …
+foreach ($c in $ExtraChars) { [void]$chars.Add([string]$c) }
+
 if ($chars.Count -eq 0) {
     throw "一个汉字都没扫到 —— 上面的扫描路径对吗？"
 }

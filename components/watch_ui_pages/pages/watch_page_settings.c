@@ -33,11 +33,12 @@
 #include "watch_pages.h"
 #include "watch_style.h"
 #include "watch_widgets.h"
+#include "watch_modal.h"
 #include "watch_strings.h"
 
 
 #ifndef WATCH_FIRMWARE_VERSION
-#define WATCH_FIRMWARE_VERSION "0.3.0"
+#define WATCH_FIRMWARE_VERSION "0.4.0"
 #endif
 
 #define ROW_TITLE_Y   0
@@ -154,6 +155,19 @@ static void weight_cb(lv_event_t *e)
     }
 }
 
+/* ==================== 两个子页面入口 ==================== */
+static void wifi_entry_cb(lv_event_t *e)
+{
+    (void)e;
+    watch_wifi_open();
+}
+
+static void dev_entry_cb(lv_event_t *e)
+{
+    (void)e;
+    watch_developer_open_menu();
+}
+
 /* ==================== 造一行"标题 + 右侧值" ==================== */
 static lv_obj_t *make_row(lv_obj_t *parent, lv_coord_t y,
                           const char *title, const char *value,
@@ -243,6 +257,18 @@ static lv_obj_t *settings_create(lv_obj_t *parent)
 
     /* ---------- 只读信息 ---------- */
     make_row(scr, y, W_STR_RTC_STATUS, W_STR_RTC_LOST, NULL, &ui.lb_rtc);
+    y += ROW_H + ROW_GAP;
+
+    /*
+     * ---------- 子页面入口 ----------
+     *
+     * WiFi 放在设置页（不是开发人员页里）：普通用户也要能自己连网校时。
+     * 开发人员选项放最底部 —— 里面的东西（IMU 录制等）普通使用不需要碰。
+     */
+    make_row(scr, y, W_STR_WIFI_TITLE, "", wifi_entry_cb, NULL);
+    y += ROW_H + ROW_GAP;
+
+    make_row(scr, y, W_STR_DEV_TITLE, "", dev_entry_cb, NULL);
 
     return scr;
 }

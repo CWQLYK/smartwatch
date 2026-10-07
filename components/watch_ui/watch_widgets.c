@@ -29,8 +29,23 @@ lv_obj_t *w_page_create(lv_obj_t *parent)
     lv_obj_set_style_pad_all(root, W_PAD_PAGE, 0);
 
     /*
-     * 页面根**不可滚动**：跟手滑动靠外层 viewport 来滚，
-     * 页面自己一滚就把拖动吃掉了（又是一次"滑不动"）。
+     * 页面根**不可滚动**（SCROLLABLE 清掉、scroll_dir = NONE）。
+     *
+     * ⚠️ 这个决定和两个之前踩过的坑直接相关，改之前先读完：
+     *
+     * 1. **为什么不让它自己滚**：一旦页面根是 SCROLLABLE，
+     *    LVGL 的 find_scroll_obj() 就会把它当成滚动候选 —— **哪怕内容
+     *    根本没超出**（那是为了做弹性回弹效果）。后果是
+     *    `indev_gesture()` 开头的 `if(scroll_obj) return;` 会直接返回，
+     *    **"上滑打开控制中心"在内容不满一屏的页面上就失效了**。
+     *
+     * 2. **为什么纵向滚动由外层轮播代管**：页面内容可能超过一屏
+     *    （设置页就有 450px，屏幕只有 280px），必须能滚。
+     *    但横向已经由轮播手动接管，如果让页面根可滚，两条路径会打架。
+     *    所以统一在 watch_pages.c 的 on_pressing() 里判断：
+     *    主轴是纵向且内容溢出 → 用 lv_obj_scroll_by_bounded() 滚当前页；
+     *    否则纵向留给手势层（上滑开控制中心）。
+     *
      * 注意 SCROLLABLE 和 SCROLL_DIR 是两个东西，都要设：
      * LVGL 的 find_scroll_obj() 判的是 scroll_dir。
      */

@@ -57,6 +57,7 @@
 #include "watch_widgets.h"
 #include "watch_gesture.h"
 #include "watch_overlay.h"
+#include "watch_modal.h"
 
 static const char *TAG = "WATCH_UI";
 
@@ -100,6 +101,14 @@ static bool       s_dragging = false;
 static lv_point_t s_drag_start;
 static bool       s_committing = false;   /* 正在重排，挡住新手势 */
 
+/*
+ * 本次按下时"当前页能纵向滚多少像素"，0 = 内容不满一屏。
+ * 在 on_pressed 里算一次，PRESSING 里直接用（别每帧都查布局）。
+ */
+static lv_coord_t s_page_scroll_limit = 0;
+/* 本次拖动已滚过的累计量，用来算增量（避免累加误差） */
+static lv_coord_t s_page_dy = 0;
+
 /* 平台钩子：亮度读写（控制中心用） */
 static watch_brightness_get_fn s_br_get = NULL;
 static watch_brightness_set_fn s_br_set = NULL;
@@ -112,6 +121,8 @@ static void slot_destroy(int slot);
 static void apply_offsets(lv_coord_t off);
 bool watch_ui_carousel_active(void);
 static esp_err_t scroll_one(int dir);
+static lv_coord_t current_page_scroll_range(void);
+static void scroll_page_to_top(void);
 
 /* ==================== 亮度钩子 ==================== */
 int watch_ui_brightness_get(void)
@@ -283,6 +294,14 @@ static void rebuild_window(void)
     }
     apply_offsets(0);
 
+    /*
+     * 新页从顶部开始显示。
+     * 不加这句的话，从"滚到一半的设置页"翻走再翻回来，
+     * 新页会停在上一页残留的滚动位置上，看起来像随机跳了一段。
+     */
+    scroll_page_to_top();
+    s_page_scroll_limit = current_page_scroll_range();
+
     /* 新页露面时补一次数据（离开期间数据可能变了） */
     watch_ui_refresh();
 
@@ -329,6 +348,91 @@ static void start_snap_anim(lv_coord_t to_off, bool commit)
 }
 
 /* ==================== 手势（跟手拖动） ==================== */
+
+/**
+ * @brief 当前页的内容是否超出屏幕高度（也就是"需不需要能滚"）
+ *
+ * 做法：把页面根临时标成可滚动，问 LVGL "下面还有多少内容"，
+ * 问完立刻恢复标记。
+ *
+ * ⚠️ 为什么要临时改标记而不是让页面根常驻可滚动：
+ *    一旦页面根是 SCROLLABLE，find_scroll_obj() 就会把它当滚动候选，
+ *    **即使内容没超出**（LVGL 要留它做弹性回弹），
+ *    于是 indev_gesture() 第一行 `if(scroll_obj) return;` 直接返回，
+ *    **内容不满一屏的页面就再也不能上滑开控制中心了**。
+ *    所以只在需要的时候借一下这个标记，平时保持 NONE。
+ *
+ * @note 每次按下只算一次（结果缓存在 s_page_scrollable），
+ *       不要在 PRESSING 里反复算 —— 那会每次触摸事件都做一遍布局查询。
+ */
+static lv_coord_t current_page_scroll_range(void)
+{
+    lv_obj_t *page = s_slot[1].page;
+    if (!page) {
+        return 0;
+    }
+
+    /* 借标记：查"还能往下滚多少" */
+    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+    lv_obj_update_layout(page);
+    const lv_coord_t bottom = lv_obj_get_scroll_bottom(page);
+    const lv_coord_t top    = lv_obj_get_scroll_top(page);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_NONE);
+
+    const lv_coord_t total = top + bottom;
+    return (total > 0) ? total : 0;
+}
+
+/** @brief 用 dx/dy 滚当前页（dy 是手指位移，内容要反向走） */
+static void scroll_page_by(lv_coord_t dy)
+{
+    lv_obj_t *page = s_slot[1].page;
+    if (!page) {
+        return;
+    }
+
+    /* 同样借标记，让 bounds 计算走 LVGL 自己的逻辑（别自己推坐标系） */
+    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+
+    /*
+     * ⚠️ 符号：**直接用 +dy，不要取负**。
+     *    第一版我写成 `-dy`，结果拖动方向是反的（用户实测反馈），
+     *    别再"顺手"加个负号。
+     *
+     * 依据 LVGL 自己的约定：
+     *   `lv_obj_get_scroll_y()` 返回的是**已经被滚掉的内容高度**，
+     *   scroll_y 越大 → 内容越往上走 → 露出越靠下的部分。
+     *   而 `lv_indev_scroll.c` 里手势滚动用的就是
+     *   `lv_obj_scroll_by(obj, diff_x, diff_y, ANIM_OFF)`，
+     *   diff_y 直接取自输入位移向量（向下为正），没有任何取反。
+     *
+     * 所以正确的映射是：
+     *   手指向下拖(dy>0) → scroll_y 增大 → 内容上移 → 看到更下面的内容
+     * 这正是所有触屏系统的标准行为（手指把内容"推"上去）。
+     */
+    lv_obj_scroll_by_bounded(page, 0, dy, LV_ANIM_OFF);
+
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_NONE);
+}
+
+/** @brief 把当前页滚回顶部（换页后调，免得新页停在上一页的滚动位置） */
+static void scroll_page_to_top(void)
+{
+    lv_obj_t *page = s_slot[1].page;
+    if (!page) {
+        return;
+    }
+    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+    lv_obj_scroll_to_y(page, 0, LV_ANIM_OFF);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_NONE);
+}
+
 static void on_pressed(lv_event_t *e)
 {
     if (s_committing) {
@@ -342,6 +446,10 @@ static void on_pressed(lv_event_t *e)
     lv_anim_del(s_vp, anim_off_cb); /* 抓住正在跑的收尾动画 */
     lv_indev_get_point(indev, &s_drag_start);
     s_dragging = true;
+    s_page_dy  = 0;
+
+    /* 这次按下的"页面能不能纵向滚"，只算一次 */
+    s_page_scroll_limit = current_page_scroll_range();
 }
 
 static void on_pressing(lv_event_t *e)
@@ -368,10 +476,27 @@ static void on_pressing(lv_event_t *e)
     const lv_coord_t dy = (lv_coord_t)(cur.y - s_drag_start.y);
 
     /*
-     * 主轴锁定：横向位移明显大于纵向才跟手。
-     * 纵向留给手势层（上滑控制中心 / 下滑关闭）。
+     * 主轴锁定：谁位移大听谁的。
+     *
+     * 纵向分支（这里是修 bug 的地方）：
+     *   页面内容超过一屏时（设置页 450px > 280px），纵向拖动应该**滚页面**。
+     *   之前的版本直接 return，把纵向完全丢给手势层（上滑开控制中心），
+     *   结果"开发人员选项"被挤到屏外且永远够不着 —— 用户实际遇到的问题。
+     *
+     *   为什么不用 LVGL 自带滚动：页面根一旦 SCROLLABLE，
+     *   内容不满一屏的页面也会被当成滚动候选，导致上滑开控制中心失效
+     *   （详见 current_page_scroll_range() 的说明）。
+     *   所以这里只对"确实溢出"的页面做滚动，其余照旧交给手势层。
      */
     if (LV_ABS(dx) <= LV_ABS(dy)) {
+        if (s_page_scroll_limit > 0) {
+            /* 按"本次拖动增量"滚，避免累加误差 */
+            const lv_coord_t step = dy - s_page_dy;
+            s_page_dy = dy;
+            if (step != 0) {
+                scroll_page_by(step);
+            }
+        }
         return;
     }
 
@@ -595,6 +720,12 @@ esp_err_t watch_ui_init(const watch_data_provider_t *provider,
     /* ---------- 5. 显示 + 订阅数据 ---------- */
     lv_scr_load(s_scr);
 
+    /*
+     * 子页面容器挂到 **screen** 上（不是挂在 s_vp 里）。
+     * 理由：子页面要盖满整屏，且不该跟着轮播容器被裁剪或平移。
+     */
+    w_modal_init(s_scr);
+
     watch_state_t st;
     s_provider->get_state(&st);
     refresh_current(&st, WATCH_CHANGED_ALL);
@@ -697,6 +828,64 @@ void watch_ui_refresh(void)
     refresh_current(&st, WATCH_CHANGED_ALL);
 }
 
+/**
+ * @brief 取当前 UTC 时间戳（界面层拿时间的唯一途径）
+ *
+ * 界面层不许 include time.h（PC 模拟器跨平台编不过），
+ * 所以这里**自己把日历换算成 Unix 时间戳**（等价于 timegm）。
+ * 这段逻辑很经典，但很容易写错，所以：
+ *   - 用"从 1970 逐年/逐月累加天数"的笨办法，一眼能验算
+ *   - 不做闰秒、不做时区（RTC 里存的就是 UTC）
+ *
+ * @return Unix 时间戳；没有有效时间时返回 0
+ */
+uint32_t watch_ui_current_epoch(void)
+{
+    if (!s_provider || !s_provider->get_state) {
+        return 0;
+    }
+    watch_state_t st;
+    s_provider->get_state(&st);
+    if (!st.time.valid) {
+        return 0;
+    }
+
+    /* ---- 日期合法性粗筛，防止脏数据算出天文数字 ---- */
+    const int y = st.time.year, mo = st.time.month, d = st.time.day;
+    if (y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31) {
+        return 0;
+    }
+
+    /* ---- 年 -> 天数 ---- */
+    uint32_t days = 0;
+    for (int yy = 1970; yy < y; yy++) {
+        const bool leap = (yy % 4 == 0 && yy % 100 != 0) || (yy % 400 == 0);
+        days += leap ? 366u : 365u;
+    }
+
+    /* ---- 月 -> 天数 ---- */
+    static const int mdays[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    const bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    for (int mm = 1; mm < mo; mm++) {
+        days += (uint32_t)mdays[mm - 1];
+        if (mm == 2 && leap) {
+            days += 1;
+        }
+    }
+
+    days += (uint32_t)(d - 1);
+
+    return days * 86400u
+         + (uint32_t)st.time.hour * 3600u
+         + (uint32_t)st.time.minute * 60u
+         + (uint32_t)st.time.second;
+}
+
+int watch_ui_debug_page_scroll(void)
+{
+    return (int)current_page_scroll_range();
+}
+
 int watch_ui_debug_scroll_x(void)
 {
     return (int)s_off;
@@ -704,6 +893,8 @@ int watch_ui_debug_scroll_x(void)
 
 void watch_ui_debug_dump(void)
 {
+    ESP_LOGI(TAG, "[dbg] 当前页可纵向滚动 %d px（0 = 内容不满一屏）",
+             (int)current_page_scroll_range());
     ESP_LOGI(TAG, "[dbg] 偏移 off=%d，当前页 [%d] '%s'，共 %d 页",
              (int)s_off, s_cur,
              s_registry[s_cur] && s_registry[s_cur]->id ? s_registry[s_cur]->id : "?",

@@ -25,6 +25,8 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_touch_cst816s.h"
 #include "esp_lvgl_port.h"
+/* 只为了 w_screen_notify_activity()：把触摸事件上报给电源模块做息屏计时 */
+#include "watch_platform.h"
 
 static const char *TAG = "BSP";
 
@@ -131,6 +133,21 @@ static esp_err_t lcd_init(void)
 }
 
 /* ==================== 触摸 ==================== */
+/**
+ * @brief 触摸读取回调（LVGL 每次采样都会调）
+ *
+ * ★ 这里同时承担"息屏/亮屏"的一部分职责：
+ *   每次检测到按下就上报一次"用户正在操作"。
+ *
+ * 为什么必须在这里上报，而不是让电源模块自己轮询触摸中断脚：
+ *   - LVGL 每 `LV_INDEV_DEF_READ_PERIOD`(5ms) 调一次本函数，**一次都不漏**
+ *   - 而电源模块轮询是 50ms 一次，快速点击很容易被漏掉；
+ *     一旦漏掉，息屏计时器就以为没人操作，用户正在点着屏幕时突然息屏
+ *     （实测用户遇到的就是这个）
+ *
+ * 屏幕灭着时 `w_screen_notify_activity()` 会顺手**只亮屏**，
+ * 所以唤醒路径也统一收在这里，power 里的轮询只剩兜底作用。
+ */
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     esp_lcd_touch_handle_t tp = (esp_lcd_touch_handle_t)drv->user_data;
@@ -144,6 +161,9 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->point.x = x;
         data->point.y = y;
         data->state   = LV_INDEV_STATE_PRESSED;
+
+        /* 上报用户活动（屏幕灭着时它会只亮屏，见 watch_platform.h） */
+        w_screen_notify_activity();
     } else {
         data->state   = LV_INDEV_STATE_RELEASED;
     }

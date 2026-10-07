@@ -16,6 +16,8 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp.h"
@@ -28,6 +30,9 @@
 #include "watch_pages.h"
 #include "watch_overlay.h"
 #include "motion.h"
+#include "imu_logger.h"
+#include "power.h"
+#include "wifi_service.h"
 #include "app_console.h"
 
 static const char *TAG = "APP";
@@ -40,7 +45,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.3.0"
+#define APP_VERSION_STR  "0.4.0"
 
 const char *app_version(void)
 {
@@ -255,6 +260,163 @@ static void settings_event_task(void *arg)
 }
 
 /* ==================================================================
+ * 五、界面 <-> 服务的钩子适配（v0.4.0 新增）
+ *
+ * 界面层不许 include ESP-IDF 头文件，所以"录 IMU""手动校时"这些能力
+ * 都要在这里翻译成界面认识的钩子。这个文件就是界面和硬件之间的
+ * **全部粘合代码** —— 想知道"界面点了按钮之后到底调了什么"，看这段。
+ *
+ * 注意类型：wifi_service.h 已经把 wifi_hooks_t 定义成
+ * watch_platform.h 里 w_wifi_hooks_t 的**别名**，所以不需要转换，
+ * 直接传指针即可（同一份定义，不可能错位）。
+ * ================================================================== */
+
+/* WiFi 钩子是否就绪。协议栈**不在开机时启动**：它吃 50KB+ RAM，
+ * 而绝大多数场景根本不会点 WiFi 页。等真要用再起。 */
+static bool s_wifi_hooks_ready = false;
+
+/* 系统信息（开发人员页显示）。只有 app 层拿得到 esp_* 数据。 */
+static char s_info_heap[24]   = "--";
+static char s_info_psram[24]  = "--";
+static char s_info_uptime[24] = "--";
+
+/* ---------- IMU 录制钩子 ---------- */
+static bool rec_hook_available(void)
+{
+    return imu_logger_available();
+}
+
+static int rec_hook_start(void)
+{
+    return (int)imu_logger_start();
+}
+
+static int rec_hook_stop(void)
+{
+    return (int)imu_logger_stop();
+}
+
+static void rec_hook_status(w_rec_status_t *out)
+{
+    if (out) {
+        imu_logger_get_status((imu_logger_status_t *)out);
+    }
+}
+
+static int rec_hook_erase(void)
+{
+    return (int)imu_logger_erase_all();
+}
+
+static const w_rec_hooks_t s_rec_hooks = {
+    .available  = rec_hook_available,
+    .start      = rec_hook_start,
+    .stop       = rec_hook_stop,
+    .get_status = rec_hook_status,
+    .erase_all  = rec_hook_erase,
+};
+
+/* ---------- 手动校时钩子（页面填的是 **UTC**）----------
+ *
+ * 用户明确要求"时间校准要存 UTC，方便后面切换时区"，
+ * 所以这里**不做任何时区换算**：页面填什么就写什么。
+ * 表盘显示时才按 settings 里的时区偏移换算。
+ */
+static int time_hook_set_utc(int year, int month, int day,
+                             int hour, int minute, int second)
+{
+    dev_time_t t = {
+        .year    = year,
+        .month   = month,
+        .day     = day,
+        .hour    = hour,
+        .minute  = minute,
+        .second  = second,
+        /* 星期由 RTC 驱动按日期自己算，这里给占位值 */
+        .weekday = 1,
+        .valid   = true,
+    };
+
+    esp_err_t err = data_hub_set_time(&t);
+    if (err == ESP_OK) {
+        settings_set(SETTINGS_TIME_VALID, 1);
+        ESP_LOGI(TAG, "手动校时（UTC）：%04d-%02d-%02d %02d:%02d:%02d",
+                 year, month, day, hour, minute, second);
+    } else {
+        ESP_LOGE(TAG, "手动校时失败: %s", esp_err_to_name(err));
+    }
+    return (int)err;
+}
+
+static int time_hook_get_tz(void)
+{
+    return (int)settings_get_or_default(SETTINGS_TIMEZONE);
+}
+
+static const w_time_hooks_t s_time_hooks = {
+    .set_local       = time_hook_set_utc,
+    .get_tz_quarters = time_hook_get_tz,
+};
+
+/* ==================================================================
+ * 六、SNTP 对时成功 -> 写 RTC
+ *
+ * ⚠️ 这里曾经写的是"SNTP 给的就是 UTC，和 RTC 存储口径一致，直接写"，
+ *    **那是错的**，直接导致北京时间慢 8 小时（用户实测报的 bug）。
+ *
+ *    实际约定（以 data_hub.c 顶部注释为准）：
+ *      **RTC 芯片里存的是"墙上时间"**，`sample_time()` 从 RTC 直读、
+ *      表盘直接显示，**不做二次时区换算**。
+ *    所以 SNTP 的 UTC 必须先加时区偏移再写进去。
+ *
+ *    顺带一提：`SETTINGS_TIMEZONE` 之前是个**摆设** ——
+ *    `time_hook_get_tz` / `get_tz_quarters` 钩子定义了却没有任何调用方。
+ *    时区换算补在这里之后，这个设置项才真正生效。
+ * ================================================================== */
+static void on_sntp_synced(uint32_t utc_epoch)
+{
+    if (utc_epoch < 1700000000u) {      /* 早于 2023-11 视为无效 */
+        ESP_LOGW(TAG, "SNTP 给的时间不合理（%u），忽略", (unsigned)utc_epoch);
+        return;
+    }
+
+    /*
+     * ★ 把 UTC 换算成**本地墙上时间**再写 RTC —— 这一步以前漏了。
+     *
+     * 本项目的约定（见 data_hub.c 顶部）：**RTC 芯片里存的就是墙上时间**，
+     * `sample_time()` 直接从 RTC 读、表盘直接显示，**不做二次换算**。
+     *
+     * ⚠️ 踩过的坑：SNTP 给的是 **UTC**，原来原样写进 RTC，
+     *    于是北京时间比实际**慢 8 小时**（用户实测："时间页面没有 +8 小时"）。
+     *    UTC 不等于墙上时间，写 RTC 前必须加上时区偏移。
+     *
+     * 时区设置的单位是 15 分钟（北京 +8 区 = 32），默认值就是 32。
+     * 加了这个换算之后，`SETTINGS_TIMEZONE` 才真正被用上
+     * （之前全工程没有任何地方读它，是个摆设）。
+     */
+    const int tz15 = settings_get_or_default(SETTINGS_TIMEZONE);
+    const int32_t offset_sec = (int32_t)tz15 * 15 * 60;
+    const uint32_t local_epoch = (uint32_t)((int64_t)utc_epoch + offset_sec);
+
+    ESP_LOGI(TAG, "SNTP 校时：UTC %u + 时区 %d(15分单位) = 本地 %u",
+             (unsigned)utc_epoch, tz15, (unsigned)local_epoch);
+
+    esp_err_t err = data_hub_set_epoch(local_epoch);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "写 RTC 失败: %s", esp_err_to_name(err));
+        return;
+    }
+    settings_set(SETTINGS_TIME_VALID, 1);
+    ESP_LOGI(TAG, "RTC 已更新为本地时间 %u", (unsigned)local_epoch);
+
+    /* 立刻刷界面，用户能马上看到表盘时间变了 */
+    if (ui_port_lock(portMAX_DELAY)) {
+        watch_ui_refresh();
+        ui_port_unlock();
+    }
+}
+
+/* ==================================================================
  * 四、启动流程
  * ================================================================== */
 esp_err_t app_start(void)
@@ -291,10 +453,30 @@ esp_err_t app_start(void)
         ESP_LOGE(TAG, "数据中枢初始化失败：界面会显示占位符，但手表仍可用");
     }
 
+    /* ---------- 3.2 电源管理：自动息屏 / 亮屏调度 ---------- */
+    /*
+     * 放这里是因为它要读 settings（息屏秒数、亮度），
+     * 而 settings 在上一步已经初始化好。
+     * 它顺便把屏幕钩子注册给界面层。
+     */
+    if (power_init() != ESP_OK) {
+        ESP_LOGW(TAG, "电源管理初始化失败，自动息屏不会生效");
+    }
+
     /* ---------- 3.5 运动服务：IMU 采样 + 计步（P1 功能 6/7） ---------- */
     /*
+     * ⚠️ 记录器必须在 motion 之前初始化：
+     *    motion_init() 会立刻启动 50Hz 采样任务，而采样任务里会调
+     *    imu_logger_feed()。记录器没就绪时 feed() 会安全返回（不崩），
+     *    但用户点"开始录制"时若文件系统还没挂上就会录不上。
+     */
+    if (imu_logger_init() != ESP_OK) {
+        ESP_LOGW(TAG, "IMU 记录器不可用（存储挂载失败），录制功能将不可用");
+    }
+
+    /*
      * 放在 data_hub 之后：它算完步数要推给 data_hub。
-     * IMU 不在线不会让启动失败，只是步数显示 "--"。
+     * IMU 不在线不会让启动失败，只是步数显示为 --。
      */
     if (motion_init() != ESP_OK) {
         ESP_LOGW(TAG, "运动服务初始化失败，步数将显示为 --");
@@ -327,6 +509,9 @@ esp_err_t app_start(void)
     /* 把"亮度"这条路接起来（界面层不认识 NVS 和背光） */
     watch_ui_set_brightness_hooks(brightness_get, brightness_set);
     watch_ui_set_setting_hooks(setting_get, setting_set);
+    w_platform_set_rec_hooks(&s_rec_hooks);
+    w_platform_set_time_hooks(&s_time_hooks);
+    w_platform_set_wifi_hooks(wifi_service_get_hooks());
 
     /* 建首页并订阅数据 */
     esp_err_t ui_err = watch_ui_init(&s_provider, &watch_page_home, 4);
@@ -340,6 +525,40 @@ esp_err_t app_start(void)
     if (xTaskCreate(settings_event_task, "settings_ev", 3072, NULL, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "设置变更订阅任务创建失败");
     }
+
+    /* ---------- 5.8 WiFi：注册对时回调 ---------- */
+    /*
+     * 只注册回调、**不启动协议栈**：
+     * WiFi 协议栈吃 50KB+ RAM，而绝大多数场景不会点 WiFi 页。
+     * 用户点进 WiFi 页（或串口下 wifi on）时才真正启动。
+     */
+    /*
+     * 启动 WiFi 服务（含按保存的凭据自动重连 + 连上后 SNTP 对时）。
+     *
+     * ⚠️ 这里改过主意，记录一下权衡：
+     *   一开始为了省 50KB RAM，约定"等用户点进 WiFi 页再启动"。
+     *   但那样用户点"扫描"时协议栈还没起来 —— 虽然现在
+     *   hook_scan_start() 会按需启动（不会再"点了没反应"），
+     *   可首次要等 8 秒 RF 校准，体验很差。
+     *   WiFi 是这个版本的核心功能（没备份电池，全靠它对时），
+     *   所以改成开机就起。实测 3.8 秒完成，RF 校准结果会缓存到 NVS，
+     *   后续开机更快。
+     */
+    if (wifi_service_init() != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 服务启动失败，WiFi 页会提示不可用");
+    }
+    wifi_service_set_time_cb(on_sntp_synced);
+    s_wifi_hooks_ready = true;
+
+    /* ---------- 5.9 系统信息注入给开发人员页 ---------- */
+    snprintf(s_info_heap, sizeof(s_info_heap), "%u KB",
+             (unsigned)(esp_get_free_heap_size() / 1024));
+    snprintf(s_info_psram, sizeof(s_info_psram), "%u KB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    snprintf(s_info_uptime, sizeof(s_info_uptime), "%lld s",
+             esp_timer_get_time() / 1000000LL);
+    watch_developer_set_sysinfo(APP_VERSION_STR, s_info_heap,
+                                s_info_psram, s_info_uptime);
 
     /* ---------- 6. 串口命令行（校时 / 查状态） ---------- */
     if (app_console_start() != ESP_OK) {

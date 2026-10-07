@@ -28,3 +28,6 @@ dependencies.lock
 Thumbs.db
 desktop.ini
 .DS_Store
+# ---- IMU 日志导出产物（tools/imu_dump.py 生成的 CSV/图片）----
+# 这些是调试数据，不该入库（一次走路就好几 MB）
+imu_logs/
