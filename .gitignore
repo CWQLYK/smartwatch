@@ -13,11 +13,15 @@ managed_components/
 dependencies.lock
 
 # ---- PC 模拟器 / 主机侧测试的产物 ----
-# lvgl_sim 的 Makefile 会直接在固件源码目录里生成 .o，
+# lvgl_sim 的 Makefile 会直接在固件源码目录里生成 .o / .d，
 # 一定要忽略，否则会把 MinGW 的目标文件混进 ESP-IDF 工程。
+#
+# .d 是 v0.5.0 加的：Makefile 用 `-MMD -MP` 生成头文件依赖，
+# 否则改了 lv_conf.h 所有 .o 都不重编（表现成"改配置一点效果没有"）。
 **/*.o
 **/*.obj
 **/*.exe
+**/*.d
 
 # ---- 编辑器里的本机配置 ----
 # settings.json 里是绝对路径 + 本机串口号，不适合共享；

@@ -55,20 +55,10 @@ static struct {
     lv_obj_t *lb_batt;       /* 卡片：电量数值      */
 } ui;
 
-/* ==================== 工具 ==================== */
-static const char *weekday_text(int iso_weekday)
-{
-    switch (iso_weekday) {
-    case 1: return W_STR_WEEK_MON;
-    case 2: return W_STR_WEEK_TUE;
-    case 3: return W_STR_WEEK_WED;
-    case 4: return W_STR_WEEK_THU;
-    case 5: return W_STR_WEEK_FRI;
-    case 6: return W_STR_WEEK_SAT;
-    case 7: return W_STR_WEEK_SUN;
-    default: return W_STR_WEEK_UNKNOWN;
-    }
-}
+/* ==================== 工具 ====================
+ * 星期映射用 watch_strings.h 里的 w_weekday_text()（static inline）——
+ * "时钟 > 时间"那一栏也要用同一份，复制两份必然会漏改一处。
+ */
 
 static void home_set_time_labels(const watch_time_t *t)
 {
@@ -85,7 +75,7 @@ static void home_set_time_labels(const watch_time_t *t)
          */
         lv_label_set_text_fmt(ui.lb_date, W_STR_DATE_FMT,
                               t->year, t->month, t->day);
-        lv_label_set_text(ui.lb_week, weekday_text(t->weekday));
+        lv_label_set_text(ui.lb_week, w_weekday_text(t->weekday));
     } else {
         /* RTC 掉过电还没校时：明确告诉用户"没数据"，而不是显示假时间 */
         lv_label_set_text(ui.lb_clock, "--:--");

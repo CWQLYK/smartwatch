@@ -20,7 +20,8 @@
 #include "qmi8658c.h"
 #include "imu_logger.h"
 #include "data_hub.h"
-#include "settings.h"
+/* 注：v0.5.0 起本文件不再读 NVS 设置（身高/体重设置项已删除），
+ *     所以不再 include "settings.h"。 */
 
 static const char *TAG = "MOTION";
 
@@ -48,27 +49,33 @@ static volatile bool     s_imu_ok = false;
 static motion_status_t   s_pub;      /* 最近一次对外公布的状态 */
 
 /* ==================== 用户参数 ==================== */
+/*
+ * ★ v0.5.0：身高、体重两个设置项已按用户要求删除（抬腕亮屏也取消了）。
+ *
+ *   步长改为**固定值**：走路 50cm / 跑步 90cm（在 imu 组件的默认配置里）。
+ *   卡路里仍然会算（数据通路保留），体重用固定常量 —— 用户要求先把
+ *   卡路里从运动页去掉，以后"开发回来"时只需在界面上加回一张卡，
+ *   算法和这里都不用改。
+ *
+ *   原来这里叫 `motion_apply_user_params()`，读的是
+ *   SETTINGS_USER_HEIGHT / SETTINGS_USER_WEIGHT。那两个键已经从
+ *   settings 里删掉了，所以本函数不再读 NVS。
+ */
+#define MOTION_DEFAULT_WEIGHT_KG   65
+
 void motion_apply_user_params(void)
 {
-    const uint16_t h = (uint16_t)settings_get_or_default(SETTINGS_USER_HEIGHT);
-    const uint16_t w = (uint16_t)settings_get_or_default(SETTINGS_USER_WEIGHT);
-    /*
-     * 性别影响卡路里公式的系数。设置里目前没有这一项（P1 不做），
-     * 先按男性系数走 —— 差别约 5%，对"参考值"来说可以接受。
-     * 以后加设置项时把这里换成 settings_get_or_default(SETTINGS_USER_SEX) 即可。
-     */
-    const bool is_male = true;
-
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
-    step_counter_set_user(&s_sc, h, w, is_male);
+    step_counter_set_weight(&s_sc, MOTION_DEFAULT_WEIGHT_KG);
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
 
-    ESP_LOGI(TAG, "用户参数：身高 %u cm，体重 %u kg（性别系数按%s）",
-             h, w, is_male ? "男" : "女");
+    ESP_LOGI(TAG, "运动参数：步长固定 走路50cm/跑步90cm，"
+                  "卡路里按体重 %d kg 估算（体重设置项已移除）",
+             MOTION_DEFAULT_WEIGHT_KG);
 }
 
 /* ==================== 采样任务 ==================== */
@@ -211,10 +218,18 @@ esp_err_t motion_init(void)
         ESP_RETURN_ON_FALSE(s_lock, ESP_ERR_NO_MEM, TAG, "运动服务锁创建失败");
     }
 
-    /* 默认参数（合成模型扫出来的起始值，未用真实腕部数据标定） */
+    /*
+     * 默认参数。
+     *
+     * ⚠️ 这里的注释以前写的是"合成模型扫出来的起始值，**未用真实腕部数据标定**"，
+     *    那是**过时的**：qmi8658c.c 的 step_counter_init() 里那组滤波/门限参数
+     *    已经用真实走路数据（50 步 / 74 步每分）重新标定过
+     *    （真实 50 步 → 51 步，误差 +2%），详见该函数里的说明。
+     *    唯一仍是"估计值"的是**步长**，v0.5.0 起固定为走路 50cm / 跑步 90cm。
+     */
     step_counter_init(&s_sc, NULL);
 
-    /* 把用户身高体重喂进去（影响步长/卡路里） */
+    /* 把卡路里用的体重喂进去（步长是固定值，不需要身高） */
     motion_apply_user_params();
 
     /*

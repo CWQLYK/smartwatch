@@ -16,6 +16,7 @@ static const w_wifi_hooks_t   *s_wifi   = NULL;
 static const w_rec_hooks_t    *s_rec    = NULL;
 static const w_time_hooks_t   *s_time   = NULL;
 static const w_screen_hooks_t *s_screen = NULL;
+static const w_buzzer_hooks_t *s_buzzer = NULL;
 
 void w_platform_set_wifi_hooks(const w_wifi_hooks_t *hooks)
 {
@@ -61,6 +62,17 @@ const w_screen_hooks_t *w_platform_screen(void)
     return s_screen;
 }
 
+void w_platform_set_buzzer_hooks(const w_buzzer_hooks_t *hooks)
+{
+    s_buzzer = hooks;
+    ESP_LOGI(TAG, "蜂鸣器钩子%s", hooks ? "已注册" : "已清除");
+}
+
+const w_buzzer_hooks_t *w_platform_buzzer(void)
+{
+    return s_buzzer;
+}
+
 /* ==================== 便捷封装 ==================== */
 
 /*
@@ -92,5 +104,19 @@ void w_screen_notify_activity(void)
 {
     if (s_screen && s_screen->notify_activity) {
         s_screen->notify_activity();
+    }
+}
+
+void w_buzzer_tone(uint32_t freq_hz)
+{
+    if (s_buzzer && s_buzzer->tone) {
+        s_buzzer->tone(freq_hz);
+    }
+}
+
+void w_buzzer_stop(void)
+{
+    if (s_buzzer && s_buzzer->stop) {
+        s_buzzer->stop();
     }
 }

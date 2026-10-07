@@ -135,31 +135,35 @@ static int32_t rhythm_cv(const uint16_t *v, uint8_t n)
 }
 
 /**
- * 步长估计（cm）
+ * @brief 步长（cm）—— **固定值**，不再按身高推算
  *
- * 走路：0.43 × 身高（100spm 名义值），随步频微调 ±0.25 %身高/spm
- * 跑步：0.95 × 身高
- * 出处：Hoogeveen et al. 2000 一类“步长 ≈ k × 身高”经验式；
- *      0.413–0.415×身高 的老系数（Pearson 1899 系）偏小，
- *      实测通常 0.41–0.45×身高，取 0.43 居中。
- * ⚠️ 这是**通用经验式**，个体差异可达 ±15%。想要准，建议做一次
- *    “走已知距离 N 步”标定，把结果直接写进 cfg 覆盖。
+ * ★ v0.5.0 改动（用户明确要求"默认一步 0.5m"）：
+ *     走路 = `cfg.stride_walk_cm`（默认 50cm）
+ *     跑步 = `cfg.stride_run_cm` （默认 90cm）
+ *
+ * ## 为什么废掉原来那套
+ *
+ * 原来用的是 `0.43 × 身高 + 步频微调`（跑步 `0.95 × 身高`）的通用经验式，
+ * 实测**明显偏大** —— 180cm 身高算出 180cm 步长（等于身高），
+ * 于是"距离"这个指标基本不可信（见交接文档 §10「步长估算偏大」）。
+ *
+ * 固定 50cm 对普通成年人走路是个偏保守但不会离谱的值，
+ * 而且**所见即所得**：距离 = 步数 × 0.5m，用户一眼能验算。
+ *
+ * ⚠️ 以后要做个体标定（走一段量过的路反算真实步长），
+ *    改 `cfg.stride_walk_cm` / `cfg.stride_run_cm` 即可，
+ *    **不要再把"身高 × 系数"那套加回来**。
  */
 static int32_t step_length_cm(const step_config_t *c, int32_t cadence_spm,
                               uint8_t activity)
 {
-    int32_t h = c->user_height_cm;
-    int32_t nominal, spm, len;
+    /* cadence 保留在签名里：以后要做"步长随步频变化"时可以从此处接 */
+    (void)cadence_spm;
 
-    if (activity == 2) return (h * 95) / 100;      /* 跑步 */
-    nominal = (h * 43) / 100;
-    spm = cadence_spm;
-    if (spm < 60)  spm = 60;
-    if (spm > 160) spm = 160;
-    len = nominal + (spm - 100) * h / 400;
-    if (len < nominal * 6 / 10)  len = nominal * 6 / 10;
-    if (len > nominal * 16 / 10) len = nominal * 16 / 10;
-    return len;
+    if (activity == 2) {
+        return c->stride_run_cm ? c->stride_run_cm : 90;
+    }
+    return c->stride_walk_cm ? c->stride_walk_cm : 50;
 }
 
 /* ==================================================================
@@ -247,9 +251,12 @@ void step_counter_init(step_counter_t *sc, const step_config_t *cfg)
         sc->cfg.commit_after       = 3;
         sc->cfg.cadence_min_spm    = 50;   /* 放宽到 50：实测 74 步每分，原来的 60 对慢走太苛刻 */
         sc->cfg.cadence_max_spm    = 230;
-        sc->cfg.user_height_cm     = 170;
+        /* ---- 步长：固定值（v0.5.0，用户要求"默认一步 0.5m"）---- */
+        sc->cfg.stride_walk_cm     = 50;
+        sc->cfg.stride_run_cm      = 90;
+        /* 体重只用于卡路里。设置里已删掉体重项，这里用固定常量；
+         * 以后"卡路里"功能开发回来时，由 app 层把真实体重填进来。 */
         sc->cfg.user_weight_kg     = 65;
-        sc->cfg.user_is_male       = 1;
     }
     if (sc->cfg.rhythm_window < 2) sc->cfg.rhythm_window = 2;
     if (sc->cfg.rhythm_window > STEP_MAX_INTERVALS)
@@ -267,12 +274,21 @@ void step_counter_settle(step_counter_t *sc, uint32_t now_ms)
     sc->ready_ms = now_ms + 600;
 }
 
-void step_counter_set_user(step_counter_t *sc, uint16_t height_cm,
-                           uint16_t weight_kg, bool is_male)
+/**
+ * @brief 设置卡路里用的体重（v0.5.0）
+ *
+ * @note 原来叫 `step_counter_set_user(height, weight, is_male)`，
+ *       身高用于步长、性别用于热量系数。v0.5.0 起：
+ *         · 步长改为固定 50/90cm → 身高不再需要
+ *         · 性别系数**本来就没被读过**（`sc_commit()` 里只按 activity 取 0.5/1.0）
+ *           —— 属于"设了但没用"的死参数，一并删掉
+ *       所以现在只剩体重一个参数（卡路里公式要用）。
+ */
+void step_counter_set_weight(step_counter_t *sc, uint16_t weight_kg)
 {
-    if (height_cm > 80 && height_cm < 250) sc->cfg.user_height_cm = height_cm;
-    if (weight_kg > 20 && weight_kg < 300) sc->cfg.user_weight_kg = weight_kg;
-    sc->cfg.user_is_male = is_male ? 1 : 0;
+    if (weight_kg > 20 && weight_kg < 300) {
+        sc->cfg.user_weight_kg = weight_kg;
+    }
 }
 
 /** 把攒下的 pending 步数落账（步数 / 距离 / 卡路里） */

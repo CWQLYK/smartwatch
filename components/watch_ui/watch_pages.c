@@ -58,6 +58,8 @@
 #include "watch_gesture.h"
 #include "watch_overlay.h"
 #include "watch_modal.h"
+#include "watch_clock.h"
+#include "watch_alert.h"
 
 static const char *TAG = "WATCH_UI";
 
@@ -562,6 +564,16 @@ static void on_state_changed(const watch_state_t *state, uint32_t changed)
     }
 
     /*
+     * ★ 先喂时钟服务，**而且要在拿 LVGL 锁之前**。
+     *
+     *   闹钟是按"墙上时间的时:分"比较的，每秒必须喂一次，一次都不能漏。
+     *   如果放在下面的 `if (!ui_port_lock(0)) return;` 之后，
+     *   LVGL 正忙的那一刻就会丢掉这一次时间 —— 极端情况下整分钟都被丢，
+     *   闹钟就哑了。喂时间只是几个赋值，不碰 UI，不需要锁。
+     */
+    watch_clock_on_time(&state->time);
+
+    /*
      * 拿不到锁说明 LVGL 正忙；丢一次刷新没关系，下一秒还会来。
      * 用 0 超时（不等待）—— 这是数据回调，不能阻塞采样任务。
      */
@@ -655,6 +667,16 @@ esp_err_t watch_ui_init(const watch_data_provider_t *provider,
         ESP_LOGW(TAG, "控制中心创建失败，上滑手势将无响应");
     }
 
+    /* ---------- 2.5 时钟服务 + 到点提醒层（v0.5.0） ----------
+     *
+     * 时钟服务必须在建 screen 之前 init：它内部会起一个**全局** lv_timer,
+     * 而 lv_timer 只要求 LVGL 已初始化（ui_port_init 时就好了），
+     * 跟 screen 没关系。
+     *
+     * 提醒层要挂在 screen 上，所以放在 s_scr 建好之后（见下面第 6 步）。
+     */
+    watch_clock_init();
+
     /* ---------- 3. screen + 纯裁剪容器 ---------- */
     s_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s_scr, W_COLOR_BG, 0);
@@ -725,6 +747,15 @@ esp_err_t watch_ui_init(const watch_data_provider_t *provider,
      * 理由：子页面要盖满整屏，且不该跟着轮播容器被裁剪或平移。
      */
     w_modal_init(s_scr);
+
+    /*
+     * 到点提醒层也挂在 screen 上，和模态**同层**（是 s_vp 的兄弟）。
+     *
+     * 为什么不用独立 screen：模态子页都是挂在这个 screen 上的普通容器，
+     * 一旦 lv_scr_load() 切走，模态还留在原 screen 上，切回来子页面栈就乱了。
+     * 提醒层靠 lv_obj_move_foreground() 保证盖在模态之上（见 watch_alert.c）。
+     */
+    watch_alert_init(s_scr);
 
     watch_state_t st;
     s_provider->get_state(&st);
@@ -818,6 +849,19 @@ lv_obj_t *watch_ui_screen(void)
     return s_scr;
 }
 
+/**
+ * @brief 已注册且参与轮播的页面数
+ *
+ * @note 这个函数在 v0.5.0 之前**只有声明没有实现**（头文件里挂着，
+ *       全工程没人调，所以一直没暴露成链接错误）。
+ *       PC 模拟器自检要按实际页数算"下一页"才不会写死 4，
+ *       所以补上实现。注册数在 watch_ui_init() 里定格到 s_count。
+ */
+int watch_pages_count(void)
+{
+    return s_count;
+}
+
 void watch_ui_refresh(void)
 {
     if (!s_inited || !s_provider) {
@@ -826,6 +870,32 @@ void watch_ui_refresh(void)
     watch_state_t st;
     s_provider->get_state(&st);
     refresh_current(&st, WATCH_CHANGED_ALL);
+}
+
+bool watch_ui_time_valid(void)
+{
+    if (!s_provider || !s_provider->get_state) {
+        return false;
+    }
+    watch_state_t st;
+    s_provider->get_state(&st);
+    return st.time.valid;
+}
+
+bool watch_ui_now(watch_time_t *out)
+{
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!s_provider || !s_provider->get_state) {
+        return false;
+    }
+    watch_state_t st;
+    s_provider->get_state(&st);
+    if (out) {
+        *out = st.time;
+    }
+    return st.time.valid;
 }
 
 /**

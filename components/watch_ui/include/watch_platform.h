@@ -83,6 +83,16 @@ typedef struct {
     uint32_t       sync_start;
     /** @brief 本次连接发起的时刻（us/1000），内部用来判连接超时 */
     uint32_t       conn_start;
+
+    /*
+     * ★ v0.5.0：用"已保存的密码"连接失败时，服务会**自动清掉保存的凭据**
+     *   （用户要求：避免路由器改了密码之后，本地存着个永远连不上的旧密码、
+     *    而界面上又只能"重新扫描"，等于卡死）。
+     *
+     *   这个标志让界面能把原因说出来，而不是只显示"连接失败（密码错或信号太差）"。
+     *   下一次成功发起连接时会被清掉。
+     */
+    bool           creds_cleared;
 } w_wifi_status_t;
 
 /** @brief WiFi 钩子表（和 wifi_service.h 的 wifi_hooks_t 逐字段对齐） */
@@ -143,16 +153,53 @@ typedef struct {
 void w_platform_set_rec_hooks(const w_rec_hooks_t *hooks);
 const w_rec_hooks_t *w_platform_rec(void);
 
+/* ==================== 蜂鸣器（v0.5.0 新增） ====================
+ *
+ * 为什么需要这组钩子：开发人员选项里的「蜂鸣器测试」要"按住响、松开停"，
+ * 秒表结束/倒计时到点/闹钟到点也要响。而界面层不许 include ESP-IDF
+ * 头文件（PC 模拟器编不过），所以只能走钩子。
+ *
+ * 模拟器上不注入 → 所有封装函数变成空操作，界面照跑不误。
+ * ================================================================== */
+
+/** @brief 蜂鸣器钩子表 */
+typedef struct {
+    /**
+     * @brief 起一个持续音（**非阻塞**）
+     * @param freq_hz 频率，板上蜂鸣器谐振点约 2700Hz
+     * @return 0 成功
+     */
+    int  (*tone)(uint32_t freq_hz);
+
+    /** @brief 停音。返回 0 成功 */
+    int  (*stop)(void);
+} w_buzzer_hooks_t;
+
+void w_platform_set_buzzer_hooks(const w_buzzer_hooks_t *hooks);
+const w_buzzer_hooks_t *w_platform_buzzer(void);
+
+/** @brief 便捷封装：起音（没接钩子时什么都不做） */
+void w_buzzer_tone(uint32_t freq_hz);
+
+/** @brief 便捷封装：停音（没接钩子时什么都不做） */
+void w_buzzer_stop(void);
+
 /* ==================== 时间校准 ==================== */
 
 /**
- * @brief 手动校时钩子（把**本地时间**写进 RTC）
+ * @brief 手动校时钩子（把**UTC**直接写进 RTC，不做时区换算）
  *
- * @note 传的是**本地时间**，app 层负责按 settings 里的时区换算成 UTC 再写 RTC。
- *       界面不做时区换算 —— 时区是配置，界面不该关心。
+ * @note ⚠️ 历史遗留的命名陷阱：字段叫 `set_local`，但**实际语义是"写 UTC"**。
+ *       用户明确要求"时间校准页填的是 UTC，方便以后切换时区"，
+ *       app 层的实现（`time_hook_set_utc`）也确实不做任何换算，
+ *       页面填什么就写什么。
+ *       表盘显示时才按 settings 里的时区偏移换算（见 data_hub.c 顶部约定）。
+ *
+ *       （这里曾经写成"传的是本地时间，app 层按 settings 换算成 UTC"，
+ *         和实现正好相反 —— 与交接文档坑 6「注释和实现说法相反」同类。）
  */
 typedef struct {
-    /** @brief 写时间：本地年月日时分秒。返回 0 成功 */
+    /** @brief 写时间：**UTC** 的年月日时分秒。返回 0 成功 */
     int  (*set_local)(int year, int month, int day,
                       int hour, int minute, int second);
     /** @brief 读当前时区（15 分钟单位），用于界面显示提示 */

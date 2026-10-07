@@ -31,8 +31,16 @@ extern "C" {
 #endif
 
 /* ==================== 页面名 / 标题 ==================== */
-#define W_STR_HOME          "表盘"
+/*
+ * ★ v0.5.0 页面结构变化：
+ *     轮播： 时间 → 运动 → 健康 → 功能列表
+ *     （原来第 1 页叫"表盘"，现在叫"时间"；第 2 页原来是"设置"，
+ *       现在设置降级成"功能列表"里的一个子页）
+ */
+#define W_STR_HOME          "时间"
+#define W_STR_FUNCTIONS     "功能列表"
 #define W_STR_SETTINGS      "设置"
+#define W_STR_CLOCK         "时钟"
 #define W_STR_HEALTH        "健康"
 #define W_STR_SPORT         "运动"
 
@@ -45,6 +53,27 @@ extern "C" {
 #define W_STR_WEEK_SAT      "周六"
 #define W_STR_WEEK_SUN      "周日"
 #define W_STR_WEEK_UNKNOWN  "---"
+
+/**
+ * @brief ISO 星期号 -> 中文（1=周一 … 7=周日）
+ *
+ * @note 写成 `static inline` 放在这个头里，是为了让"表盘"和"时钟 > 时间"
+ *       两个页面共用同一份映射 —— 复制两份的话，改文案时一定会漏一处。
+ *       （放 watch_ui 的控件层不行：那一层不许依赖 watch_ui_pages 的文案表。）
+ */
+static inline const char *w_weekday_text(int iso_weekday)
+{
+    switch (iso_weekday) {
+    case 1: return W_STR_WEEK_MON;
+    case 2: return W_STR_WEEK_TUE;
+    case 3: return W_STR_WEEK_WED;
+    case 4: return W_STR_WEEK_THU;
+    case 5: return W_STR_WEEK_FRI;
+    case 6: return W_STR_WEEK_SAT;
+    case 7: return W_STR_WEEK_SUN;
+    default: return W_STR_WEEK_UNKNOWN;
+    }
+}
 
 /* ==================== 日期格式 ====================
  *
@@ -96,20 +125,24 @@ extern "C" {
 #define W_STR_HINT_SWIPE    "左右滑动切页"
 #define W_STR_HINT_UP       "上滑控制中心"
 
-/* ==================== 设置页：可点项（P1 功能 8/9/12/13 用） ====================
+/* ==================== 设置页：可点项（P1 功能 8/9/13 用） ====================
  *
  * ⚠️ 新增中文一律写在这里，别直接写在页面代码里 ——
  *    字库生成脚本会扫这个文件，漏了就是豆腐块（踩过三次）。
+ *
+ * ★ v0.5.0 删除的三行（连同设置项本身）：
+ *     W_STR_WRIST_WAKE  抬腕亮屏  —— 功能取消
+ *     W_STR_USER_HEIGHT 身高      —— 步长改为固定值
+ *     W_STR_USER_WEIGHT 体重      —— 设置项删除（卡路里用内部固定体重）
  * ================================================================== */
 #define W_STR_AUTO_SCREEN   "自动息屏"
-#define W_STR_WRIST_WAKE    "抬腕亮屏"
 #define W_STR_ON            "开"
 #define W_STR_OFF           "关"
 #define W_STR_SECONDS_SUF   " 秒"
 #define W_STR_NEVER         "常亮"
+/* 步数目标：设置项仍在（SETTINGS_STEP_GOAL），但 v0.5.0 按要求
+ * 从设置页去掉了这一行。字符串留着，以后做"目标达成提醒"时直接接回。 */
 #define W_STR_STEP_GOAL     "步数目标"
-#define W_STR_USER_HEIGHT   "身高"
-#define W_STR_USER_WEIGHT   "体重"
 
 /* ==================== 开发人员选项 ==================== */
 #define W_STR_DEV_TITLE        "开发人员选项"
@@ -162,6 +195,9 @@ extern "C" {
 #define W_STR_WIFI_CONNECTING   "连接中…"
 #define W_STR_WIFI_CONNECTED    "已连接"
 #define W_STR_WIFI_FAILED       "连接失败（密码错或信号太差）"
+/* v0.5.0：用"已保存的密码"连接失败时，服务会自动清掉那条凭据。
+ *        必须告诉用户，否则他会疑惑"我刚存的密码怎么没了"。 */
+#define W_STR_WIFI_CREDS_CLEARED "已自动清除保存的密码，请重新点这个网络输入新密码"
 #define W_STR_WIFI_IDLE         "未连接"
 #define W_STR_WIFI_RECONNECTING "正在用已保存的密码重连…"
 #define W_STR_WIFI_DISCONNECT   "断开连接"
@@ -178,6 +214,81 @@ extern "C" {
 #define W_STR_WIFI_POWER_WARN   "WiFi 已开，耗电较大"
 #define W_STR_WIFI_POWER_HINT   "WiFi 保持连接会比较费电。不用的时候请回到本页点【断开】，可以明显延长续航。"
 #define W_STR_OK                "知道了"
+
+/* ==================================================================
+ * v0.5.0 新增文案（功能列表页 / 时钟页 / 蜂鸣器测试 / 全局提醒）
+ *
+ * ⚠️ 只允许出现这几类字符，否则一定是豆腐块：
+ *      ASCII 0x20-0x7F
+ *      CJK 统一汉字   U+4E00-U+9FFF
+ *      中文标点       U+3000-U+303F
+ *      全角形式       U+FF00-U+FFEF
+ *      省略号 …       U+2026（脚本里 ExtraChars 显式加的）
+ *    不要用 ·(00B7) °(00B0) →(2192) ×(00D7) 这些 —— 两边都不沾。
+ * ================================================================== */
+
+/* ---------- 通用按钮 ----------
+ * ⚠️ "取消""确定""返回""停止"这些**没有**放进本表：
+ *    用它们的是 watch_ui 组件里的通用控件（滚轮弹窗 watch_wheel.c、
+ *    提醒层 watch_alert.c、模态返回键 watch_modal.c）——
+ *    而 watch_ui **不许** include 本文件（依赖方向是反的）。
+ *    按项目既有约定，那一层的中文直接写字面量，字库脚本照样会收进去。 */
+#define W_STR_START         "开始"
+#define W_STR_PAUSE         "暂停"
+#define W_STR_RESUME        "继续"
+#define W_STR_RESET         "复位"
+
+/* ---------- 功能列表页：4 行的副标题 ---------- */
+#define W_STR_FUNC_SET_SUB     "亮度 / 息屏 / 显示"
+#define W_STR_FUNC_CLOCK_SUB   "秒表 / 倒计时 / 闹钟"
+#define W_STR_FUNC_WIFI_SUB    "连接网络并自动校时"
+#define W_STR_FUNC_DEV_SUB     "录制 / 系统信息 / 蜂鸣器"
+
+/* ---------- 时钟页：标签栏 ----------
+ * 用字符串字面量拼接（C 的相邻字面量会自动接上），
+ * 这样字库脚本按引号逐个匹配也能把每个标签的字都收进去。 */
+#define W_STR_TAB_TIME      "时间"
+#define W_STR_TAB_SW        "秒表"
+#define W_STR_TAB_CD        "倒计时"
+#define W_STR_TAB_ALARM     "闹钟"
+#define W_STR_TABBAR        W_STR_TAB_TIME "\n" W_STR_TAB_SW "\n" \
+                            W_STR_TAB_CD "\n" W_STR_TAB_ALARM
+
+/* ---------- 时钟 > 时间 ---------- */
+#define W_STR_MANUAL_SET    "手动校时"
+
+/* ---------- 时钟 > 秒表 ---------- */
+#define W_STR_SW_HINT       "点【开始】计时，可暂停后继续"
+
+/* ---------- 时钟 > 倒计时 ---------- */
+#define W_STR_CD_DURATION   "时长"
+#define W_STR_CD_CUSTOM     "定时"
+#define W_STR_CD_RING       "响铃时长"
+#define W_STR_CD_SET_TITLE  "自定义定时"
+#define W_STR_CD_RING_TITLE "响铃时长"
+#define W_STR_CD_HINT       "点【时长】循环切换预设，或点【定时】自定义"
+#define W_STR_UNIT_HOUR     "时"
+#define W_STR_UNIT_MIN      "分"
+#define W_STR_UNIT_SEC      "秒"
+
+/* ---------- 时钟 > 闹钟 ---------- */
+#define W_STR_ALARM_TIME    "闹钟时间"
+#define W_STR_ALARM_ENABLE  "启用闹钟"
+#define W_STR_ALARM_TITLE   "设置闹钟"
+#define W_STR_ALARM_HINT    "每天重复。到点会响铃并弹提示，点【停止】结束。"
+/* ⚠️ RTC 没有备份电池，掉电后时间是 --:--，此时闹钟必须不生效 */
+#define W_STR_ALARM_NO_TIME "时间未校准，闹钟不会生效（请先连 WiFi 对时）"
+
+/* ---------- 开发人员选项 > 蜂鸣器测试 ---------- */
+#define W_STR_DEV_BUZZER       "蜂鸣器测试"
+#define W_STR_DEV_BUZZER_SUB   "按住响，松开停"
+#define W_STR_BUZZER_HOLD      "按住试听"
+#define W_STR_BUZZER_HINT      "按住上面的按钮，蜂鸣器持续发声；松开手指立即停止。"
+
+/* ---------- 全局到点提醒 ----------
+ * 注意：提醒层本身（watch_alert.c）里的中文是字面量，原因见上面"通用按钮"。
+ * 这里只留**页面侧**要用的。 */
+#define W_STR_ALARM_TITLE_PAGE  "闹钟"
 
 #ifdef __cplusplus
 }

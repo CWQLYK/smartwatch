@@ -31,6 +31,7 @@
 #include "watch_overlay.h"
 #include "motion.h"
 #include "imu_logger.h"
+#include "buzzer.h"
 #include "power.h"
 #include "wifi_service.h"
 #include "app_console.h"
@@ -45,7 +46,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.4.0"
+#define APP_VERSION_STR  "0.5.0"
 
 const char *app_version(void)
 {
@@ -163,7 +164,12 @@ static int brightness_set(int percent)
     return (int)err;
 }
 
-/* ---------- 设置项（界面层按名字寻址，这里映射到真正的 NVS 项） ---------- */
+/* ---------- 设置项（界面层按名字寻址，这里映射到真正的 NVS 项） ----------
+ *
+ * ★ v0.5.0：
+ *   - 删除：`wrist_wake` / `height` / `weight`（抬腕亮屏取消、步长改固定值）
+ *   - 新增：闹钟与倒计时的 5 项（时钟服务用，见 watch_pages.h 的 W_SETTING_*）
+ */
 static int setting_get(const char *key, int def)
 {
     if (!key) {
@@ -172,17 +178,24 @@ static int setting_get(const char *key, int def)
     if (strcmp(key, W_SETTING_AUTO_SCREEN) == 0) {
         return (int)settings_get_or_default(SETTINGS_SCREEN_TIMEOUT);
     }
-    if (strcmp(key, W_SETTING_WRIST_WAKE) == 0) {
-        return (int)settings_get_or_default(SETTINGS_WRIST_WAKE);
-    }
     if (strcmp(key, W_SETTING_STEP_GOAL) == 0) {
         return (int)settings_get_or_default(SETTINGS_STEP_GOAL);
     }
-    if (strcmp(key, W_SETTING_HEIGHT) == 0) {
-        return (int)settings_get_or_default(SETTINGS_USER_HEIGHT);
+    /* ---- v0.5.0 时钟服务 ---- */
+    if (strcmp(key, W_SETTING_ALARM_HOUR) == 0) {
+        return (int)settings_get_or_default(SETTINGS_ALARM_HOUR);
     }
-    if (strcmp(key, W_SETTING_WEIGHT) == 0) {
-        return (int)settings_get_or_default(SETTINGS_USER_WEIGHT);
+    if (strcmp(key, W_SETTING_ALARM_MIN) == 0) {
+        return (int)settings_get_or_default(SETTINGS_ALARM_MIN);
+    }
+    if (strcmp(key, W_SETTING_ALARM_EN) == 0) {
+        return (int)settings_get_or_default(SETTINGS_ALARM_EN);
+    }
+    if (strcmp(key, W_SETTING_CD_PRESET) == 0) {
+        return (int)settings_get_or_default(SETTINGS_CD_PRESET_SEC);
+    }
+    if (strcmp(key, W_SETTING_CD_RING) == 0) {
+        return (int)settings_get_or_default(SETTINGS_CD_RING_SEC);
     }
     ESP_LOGW(TAG, "未知设置项键名 '%s'，返回默认值 %d", key, def);
     return def;
@@ -198,26 +211,29 @@ static int setting_set(const char *key, int value)
 
     if (strcmp(key, W_SETTING_AUTO_SCREEN) == 0) {
         err = settings_set(SETTINGS_SCREEN_TIMEOUT, value);
-    } else if (strcmp(key, W_SETTING_WRIST_WAKE) == 0) {
-        err = settings_set(SETTINGS_WRIST_WAKE, value);
     } else if (strcmp(key, W_SETTING_STEP_GOAL) == 0) {
         err = settings_set(SETTINGS_STEP_GOAL, value);
-    } else if (strcmp(key, W_SETTING_HEIGHT) == 0) {
-        err = settings_set(SETTINGS_USER_HEIGHT, value);
-    } else if (strcmp(key, W_SETTING_WEIGHT) == 0) {
-        err = settings_set(SETTINGS_USER_WEIGHT, value);
+    }
+    /* ---- v0.5.0 时钟服务 ---- */
+    else if (strcmp(key, W_SETTING_ALARM_HOUR) == 0) {
+        err = settings_set(SETTINGS_ALARM_HOUR, value);
+    } else if (strcmp(key, W_SETTING_ALARM_MIN) == 0) {
+        err = settings_set(SETTINGS_ALARM_MIN, value);
+    } else if (strcmp(key, W_SETTING_ALARM_EN) == 0) {
+        err = settings_set(SETTINGS_ALARM_EN, value);
+    } else if (strcmp(key, W_SETTING_CD_PRESET) == 0) {
+        err = settings_set(SETTINGS_CD_PRESET_SEC, value);
+    } else if (strcmp(key, W_SETTING_CD_RING) == 0) {
+        err = settings_set(SETTINGS_CD_RING_SEC, value);
     } else {
         ESP_LOGW(TAG, "未知设置项键名 '%s'", key);
         return -1;
     }
 
-    /* 身高体重直接影响步长和卡路里，改完要让计步算法立刻拿到新值 */
-    if (err == ESP_OK &&
-        (strcmp(key, W_SETTING_HEIGHT) == 0 ||
-         strcmp(key, W_SETTING_WEIGHT) == 0)) {
-        motion_apply_user_params();
-    }
-
+    /*
+     * 注：v0.5.0 之前这里还有一段"身高体重变了要通知计步算法"的逻辑。
+     *     现在步长是固定值、体重设置项已删除，不再需要。
+     */
     return (int)err;
 }
 
@@ -358,6 +374,29 @@ static const w_time_hooks_t s_time_hooks = {
     .get_tz_quarters = time_hook_get_tz,
 };
 
+/* ---------- 蜂鸣器钩子（v0.5.0）----------
+ *
+ * 界面层要做"按住响、松开停"，还要给倒计时/闹钟报时，但不能 include
+ * ESP-IDF，所以走这里注入。
+ *
+ * ⚠️ 踩过的坑：`buzzer_init()` 在 v0.5.0 之前**全工程没有任何调用方** ——
+ *    驱动写得再完整，没初始化就是按了不响。
+ */
+static int buzzer_hook_tone(uint32_t freq_hz)
+{
+    return (int)buzzer_tone(freq_hz);
+}
+
+static int buzzer_hook_stop(void)
+{
+    return (int)buzzer_stop();
+}
+
+static const w_buzzer_hooks_t s_buzzer_hooks = {
+    .tone = buzzer_hook_tone,
+    .stop = buzzer_hook_stop,
+};
+
 /* ==================================================================
  * 六、SNTP 对时成功 -> 写 RTC
  *
@@ -463,7 +502,19 @@ esp_err_t app_start(void)
         ESP_LOGW(TAG, "电源管理初始化失败，自动息屏不会生效");
     }
 
-    /* ---------- 3.5 运动服务：IMU 采样 + 计步（P1 功能 6/7） ---------- */
+    /* ---------- 3.5 蜂鸣器（v0.5.0 起真正启用） ----------
+     *
+     * 放这里是因为它对别的组件没有依赖，早初始化早可用。
+     * 失败不算致命：手表其余功能照常，只是没有提示音。
+     *
+     * ⚠️ 资源占用：LEDC **TIMER_1 + CHANNEL_1**
+     *    （TIMER_0 / CHANNEL_0 已经被 LCD 背光占了，别撞）。
+     */
+    if (buzzer_init() != ESP_OK) {
+        ESP_LOGW(TAG, "蜂鸣器初始化失败，提示音将不可用");
+    }
+
+    /* ---------- 3.6 运动服务：IMU 采样 + 计步（P1 功能 6/7） ---------- */
     /*
      * ⚠️ 记录器必须在 motion 之前初始化：
      *    motion_init() 会立刻启动 50Hz 采样任务，而采样任务里会调
@@ -511,6 +562,7 @@ esp_err_t app_start(void)
     watch_ui_set_setting_hooks(setting_get, setting_set);
     w_platform_set_rec_hooks(&s_rec_hooks);
     w_platform_set_time_hooks(&s_time_hooks);
+    w_platform_set_buzzer_hooks(&s_buzzer_hooks);
     w_platform_set_wifi_hooks(wifi_service_get_hooks());
 
     /* 建首页并订阅数据 */
@@ -526,23 +578,17 @@ esp_err_t app_start(void)
         ESP_LOGW(TAG, "设置变更订阅任务创建失败");
     }
 
-    /* ---------- 5.8 WiFi：注册对时回调 ---------- */
+    /* ---------- 5.8 WiFi：注册对时回调 + 启动服务 ---------- */
     /*
-     * 只注册回调、**不启动协议栈**：
-     * WiFi 协议栈吃 50KB+ RAM，而绝大多数场景不会点 WiFi 页。
-     * 用户点进 WiFi 页（或串口下 wifi on）时才真正启动。
-     */
-    /*
-     * 启动 WiFi 服务（含按保存的凭据自动重连 + 连上后 SNTP 对时）。
+     * ⚠️ 这里改过主意，注释一度和代码相反（"只注册回调、不启动协议栈"，
+     *    结果下一段就 init 了）。现在只有一套说法，如下：
      *
-     * ⚠️ 这里改过主意，记录一下权衡：
      *   一开始为了省 50KB RAM，约定"等用户点进 WiFi 页再启动"。
-     *   但那样用户点"扫描"时协议栈还没起来 —— 虽然现在
-     *   hook_scan_start() 会按需启动（不会再"点了没反应"），
-     *   可首次要等 8 秒 RF 校准，体验很差。
-     *   WiFi 是这个版本的核心功能（没备份电池，全靠它对时），
-     *   所以改成开机就起。实测 3.8 秒完成，RF 校准结果会缓存到 NVS，
-     *   后续开机更快。
+     *   但那样用户点"扫描"时协议栈还没起来 —— 虽然 hook_scan_start()
+     *   会按需启动（不会再"点了没反应"），可首次要等 8 秒 RF 校准，
+     *   体验很差。
+     *   WiFi 是核心功能（RTC 没备份电池，全靠它对时），所以改成**开机就起**。
+     *   实测 3.8 秒完成，RF 校准结果会缓存到 NVS，后续开机更快。
      */
     if (wifi_service_init() != ESP_OK) {
         ESP_LOGW(TAG, "WiFi 服务启动失败，WiFi 页会提示不可用");

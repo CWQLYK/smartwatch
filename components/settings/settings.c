@@ -32,12 +32,15 @@ static const settings_desc_t s_desc[SETTINGS_COUNT] = {
     [SETTINGS_BRIGHTNESS]     = { "bl",      70,     5,   100, "屏幕亮度(%)" },
     [SETTINGS_SCREEN_TIMEOUT] = { "scr_to",  30,     0,   120, "自动息屏(秒，0=常亮)" },
     [SETTINGS_STEP_GOAL]      = { "steps_gl",8000,1000, 50000, "每日步数目标" },
-    [SETTINGS_USER_HEIGHT]    = { "height",  170,   100,   250, "身高(cm)" },
-    [SETTINGS_USER_WEIGHT]    = { "weight",  65,     30,   200, "体重(kg)" },
-    [SETTINGS_WRIST_WAKE]     = { "wrist",    1,      0,     1, "抬腕亮屏" },
     [SETTINGS_TIMEZONE]       = { "tz",      32,    -48,    56, "时区(15分钟单位)" },
     [SETTINGS_TIME_VALID]     = { "t_valid",  0,      0,     1, "RTC 已校时" },
     [SETTINGS_TIME_EPOCH]     = { "t_epoch",  0,      0, INT32_MAX, "最后已知时间戳" },
+    /* ---------- v0.5.0 新增：闹钟 / 倒计时 ---------- */
+    [SETTINGS_ALARM_HOUR]     = { "alm_h",    7,      0,    23, "闹钟-时" },
+    [SETTINGS_ALARM_MIN]      = { "alm_m",    0,      0,    59, "闹钟-分" },
+    [SETTINGS_ALARM_EN]       = { "alm_en",   0,      0,     1, "闹钟开关" },
+    [SETTINGS_CD_PRESET_SEC]  = { "cd_set", 300,     10, 86399, "倒计时时长(秒)" },
+    [SETTINGS_CD_RING_SEC]    = { "cd_ring", 10,      1,   300, "倒计时响铃时长(秒)" },
 };
 
 /* ==================== 运行期状态 ==================== */

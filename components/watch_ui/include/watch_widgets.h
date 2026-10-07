@@ -178,6 +178,109 @@ lv_obj_t *w_divider_create(lv_obj_t *parent, lv_coord_t w);
  */
 void w_set_placeholder(lv_obj_t *label, bool placeholder);
 
+/* ==================================================================
+ * 四、菜单行与大按钮（v0.5.0 从 watch_page_developer.c 提升上来）
+ *
+ * 原来这两个是开发人员页里的 static 函数。v0.5.0 加了"功能列表页"
+ * 和"时钟页"，三个页面都要用同一种菜单行和同一种大按钮 ——
+ * 与其复制三份（圆角/内边距/字色一定会慢慢跑偏），不如放公共层。
+ * ================================================================== */
+
+/**
+ * @brief 造一个"纵向排列"的容器（flex column、不滚动、不抢事件）
+ *
+ * ## 为什么需要它
+ *
+ * 两种父容器的排版方式**不一样**：
+ *   - **轮播页**的根是绝对定位（不能 flex、不能滚动，见 w_page_create）；
+ *   - **模态子页**的 body 已经是 flex column（见 watch_modal.c 的 build_page）。
+ *
+ * 而"菜单行"这类控件（`w_menu_row_create`）是靠父容器的 flex 排列的
+ * （自己不设 x/y，因为设了在 flex 里会被忽略、在绝对定位里又会叠在一起）。
+ *
+ * 所以轮播页里想放一串菜单行时，用它包一层：两边就都统一了。
+ *
+ * @param x,y  相对父对象的位置（父容器是 flex 时传 W_AUTO_POS）
+ * @param w,h  尺寸（h 传 W_AUTO_SIZE 表示按内容自适应）
+ * @param gap  行间距
+ */
+lv_obj_t *w_flex_col_create(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                            lv_coord_t w, lv_coord_t h, lv_coord_t gap);
+
+/**
+ * @brief 造一个"标题 + 副标题 + 右箭头"的可点菜单行
+ *
+ * @param parent 父容器（**必须放在 flex column 里**：本函数不设 x/y，
+ *               由父容器的 flex 布局排布；行高固定 52）
+ * @param title  主标题（中文，走中文字库）
+ * @param sub    副标题（中文，可传 NULL 表示不要副标题）
+ * @param cb     点击回调（可传 NULL 表示只显示不可点）
+ */
+lv_obj_t *w_menu_row_create(lv_obj_t *parent, const char *title, const char *sub,
+                            lv_event_cb_t cb);
+
+/**
+ * @brief 造一个大按钮
+ *
+ * @param parent 父容器（放 flex column 里就是整行一个；
+ *               放 flex row 里请自己传宽度）
+ * @param text   按钮文字（中文走中文字库）
+ * @param w      宽度；传 **W_AUTO_SIZE** 表示撑满父容器（LV_PCT(100)）
+ * @param h      高度；传 **0** 表示 48
+ * @param bg     底色；传 **W_COLOR_AUTO** 表示卡片色
+ * @param fg     字色；传 **W_COLOR_AUTO** 表示主文字色
+ * @param font   字体；传 **NULL** 表示中文字库 16
+ * @param cb     点击回调（可传 NULL）
+ *
+ * @note 需要"按住响、松开停"这类交互时，cb 传 NULL，
+ *       自己在返回的对象上补事件：
+ *           lv_obj_add_event_cb(b, press_cb,   LV_EVENT_PRESSED,    NULL);
+ *           lv_obj_add_event_cb(b, release_cb, LV_EVENT_RELEASED,   NULL);
+ *           lv_obj_add_event_cb(b, release_cb, LV_EVENT_PRESS_LOST, NULL);
+ *       ⚠️ RELEASED 和 PRESS_LOST **两个都要挂** —— 手指滑出按钮时
+ *          只会发 PRESS_LOST，只挂 RELEASED 的话蜂鸣器会一直响。
+ */
+lv_obj_t *w_btn_create(lv_obj_t *parent, const char *text,
+                       lv_coord_t w, lv_coord_t h,
+                       lv_color_t bg, lv_color_t fg,
+                       const lv_font_t *font, lv_event_cb_t cb);
+
+/**
+ * @brief 标签栏切换回调
+ * @param idx  新选中的下标（0 起）
+ * @param user w_tabbar_create() 传进来的 user
+ */
+typedef void (*w_tabbar_cb_t)(int idx, void *user);
+
+/**
+ * @brief 造一个"标签栏"（分段按钮：一次只有一个选中）
+ *
+ * @param parent 父容器
+ * @param labels 以 '\n' 分隔的标签文字，如 "时间\n秒表\n倒计时\n闹钟"
+ * @param active 初始选中项下标
+ * @param cb     切换回调（可传 NULL）
+ * @param user   透传给回调
+ * @return 标签栏容器对象；标签为空时返回 NULL
+ *
+ * @note 用**普通按钮 + flex 等宽平分**实现，选中态自己维护 ——
+ *       不用 `lv_btnmatrix` 的原因见 watch_widgets.c 里的详细说明
+ *       （它的 map 只存指针不拷贝、而且画错了也不报错，
+ *         v0.5.0 实测 4 个标签被画成了一个大按钮）。
+ *
+ * @note ⚠️ 同一时刻只支持**一个**标签栏（全项目只有时钟页用）。
+ */
+lv_obj_t *w_tabbar_create(lv_obj_t *parent, const char *labels, uint16_t active,
+                          w_tabbar_cb_t cb, void *user);
+
+/**
+ * @brief 程序化切换标签栏选中项（调试/自检用）
+ * @return 0 成功；-1 失败（没有标签栏或下标越界）
+ */
+int w_tabbar_set_active(uint16_t idx);
+
+/** @brief 当前选中项下标；没有标签栏时返回 -1 */
+int w_tabbar_active(void);
+
 #ifdef __cplusplus
 }
 #endif

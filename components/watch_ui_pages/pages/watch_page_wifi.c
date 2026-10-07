@@ -737,6 +737,18 @@ static void wifi_page_build(lv_obj_t *parent, void *user)
          *    表现成"失败之后怎么点都扫不出 wifi"。
          */
         set_status(W_STR_WIFI_FAILED, W_COLOR_WARN);
+        /*
+         * ★ v0.5.0：如果这次失败用的是"已保存的密码"，服务已经把那条
+         *   凭据自动清掉了（用户要求：避免路由器改了密码之后卡死）。
+         *   必须把这件事说出来，否则用户会疑惑"我刚存的密码呢"。
+         *   清掉之后，重新扫再点这个网络就会**直接问密码**，能救回来。
+         */
+        if (st.creds_cleared) {
+            lv_obj_t *note = w_label_create_auto(parent, W_STR_WIFI_CREDS_CLEARED,
+                                                 W_FONT_SMALL, 14, W_COLOR_ACCENT);
+            lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(note, LV_PCT(100));
+        }
         wide_btn(parent, W_STR_WIFI_RESCAN, W_COLOR_CARD, rescan_cb);
         break;
 

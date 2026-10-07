@@ -27,21 +27,39 @@ extern "C" {
 /* ==================================================================
  * 一、设置项清单
  *
- * 约定：每个枚举值对应 settings.h 里的一行表项。
- *       新增设置项时**只能往末尾加**（枚举值会被当作 NVS 索引使用）。
+ * 约定：每个枚举值对应 settings.c 里 s_desc[] 的**一行（下标）**。
+ *
+ * ⚠️ 这里曾经写的是"枚举值会被当作 NVS 索引使用"，**那是错的**：
+ *    NVS 存的是**字符串键名**（s_desc[i].nvs_key，如 "bl"/"scr_to"），
+ *    枚举值只是 s_desc[] 的数组下标，两者没有关系。
+ *    所以：
+ *      · 删掉中间某一项**不会**让别的项读错（旧 NVS 键只是被忽略）
+ *      · 但 SETTINGS_BIT() 掩码是按枚举值算的，运行期事件掩码会变
+ *    新增设置项仍然**一律加在末尾**（省得翻历史、也方便对照版本记录）。
  * ================================================================== */
 typedef enum {
     SETTINGS_BRIGHTNESS = 0,   ///< 屏幕亮度 5-100 (%)
     SETTINGS_SCREEN_TIMEOUT,   ///< 自动息屏时间 5-120 (秒)，0 = 永不
     SETTINGS_STEP_GOAL,        ///< 每日步数目标 1000-50000 (步)
-    SETTINGS_USER_HEIGHT,      ///< 身高 100-250 (cm)，用于步长估算
-    SETTINGS_USER_WEIGHT,      ///< 体重 30-200 (kg)，用于卡路里估算
-    SETTINGS_WRIST_WAKE,       ///< 抬腕亮屏 0/1
     SETTINGS_TIMEZONE,         ///< 时区偏移，单位 15 分钟（+8 区 = 32）
     SETTINGS_TIME_VALID,       ///< RTC 是否已校时过 0/1（掉电检测用，见下）
     SETTINGS_TIME_EPOCH,       ///< 最后一次已知 Unix 时间戳（RTC 掉电后的兜底）
+    /* ---------- v0.5.0 新增：闹钟 / 倒计时 ---------- */
+    SETTINGS_ALARM_HOUR,       ///< 闹钟-时 0-23
+    SETTINGS_ALARM_MIN,        ///< 闹钟-分 0-59
+    SETTINGS_ALARM_EN,         ///< 闹钟开关 0/1
+    SETTINGS_CD_PRESET_SEC,    ///< 倒计时上次选的时长（秒）
+    SETTINGS_CD_RING_SEC,      ///< 倒计时到点后的响铃时长（秒），默认 10
     SETTINGS_COUNT             ///< 哨兵，必须放最后
 } settings_key_t;
+
+/*
+ * v0.5.0 删除的三项（按用户要求），**连枚举和 NVS 键一起删**：
+ *   SETTINGS_USER_HEIGHT / SETTINGS_USER_WEIGHT  —— 步长改为固定值，不再按身高推算
+ *   SETTINGS_WRIST_WAKE                          —— 抬腕亮屏功能取消
+ * 老设备 NVS 里残留的 "height"/"weight"/"wrist" 三个键会被直接忽略，
+ * 不会影响其它设置项（理由见上面的说明）。
+ */
 
 /** @brief 变更位掩码：1UL << settings_key_t */
 #define SETTINGS_BIT(key)   (1UL << (key))

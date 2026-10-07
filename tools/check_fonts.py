@@ -33,8 +33,47 @@ ASCII_FONTS = {"W_FONT_TINY", "W_FONT_SMALL", "W_FONT_NORMAL", "W_FONT_MEDIUM",
 
 CJK = re.compile(r"[\u4E00-\u9FFF\u3000-\u303F\uFF00-\uFFEF]")
 
-# 这些控件工厂的第 3 个参数是"字体"
-LABEL_FACTORIES = ("w_label_create",)
+# 这些控件工厂的**某个参数**是"字体"，且文案是另一个参数。
+#
+# 名字 -> (文案参数下标, 字体参数下标)
+#
+# ⚠️ 为什么要把 w_btn_create 也列进来（v0.5.0 补的）：
+#    滚轮弹窗的"取消/确定"两个按钮传了 W_FONT_NORMAL（Montserrat，
+#    只有 ASCII），实机上就是两个豆腐块。而当时这个脚本**只查
+#    w_label_create**，完全没覆盖按钮工厂 —— 工具没兜住，人也没看出来。
+#    教训同 check_glyphs 那次：**校验工具的覆盖面必须跟着代码长**。
+#
+#    w_btn_create(parent, text, w, h, bg, fg, font, cb)
+#                              ↑文案            ↑字体
+LABEL_FACTORIES = {
+    "w_label_create":  (1, 2),   # (text, font)
+    "w_btn_create":    (1, 6),   # (text, font)
+}
+
+
+def strip_block_comments(text):
+    """
+    把 /* ... */ 整块注释剥掉，换成等量的换行以**保持行号不变**。
+
+    为什么要剥（这个脚本被自己骗过一次）：
+        有人（我）在注释里写示例代码来解释"这里原来是怎么写的"，
+        例如：
+            /* 这里原来是 w_label_create(parent, value, W_FONT_MEDIUM, ...)，
+               改成了自动字体 */
+        下面那句 `w_label_create\\s*\\(` 的正则就会**匹配到注释里的示例**，
+        报出一个根本不存在的豆腐块问题。
+
+        同类教训项目里已经有过一次：check_glyphs.py 早期版本去匹配
+        `/* U+XXXX */` 注释来判断字库覆盖，结果注释列的是字形位图、
+        和 LVGL 真正查表的 cmaps 不是一回事，误判成"字库没问题"。
+
+    顺带也剥 `//` 行注释 —— 原来只在 collect_string_vars 里剥，
+    主循环没剥，同样会被注释里的示例骗到。
+    """
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"),
+                  text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
 
 
 def load_macros():
@@ -139,22 +178,35 @@ def main():
     problems = []
 
     for path in sorted(list(PAGES.rglob("*.c")) + list(UI.rglob("*.c"))):
-        text = path.read_text(encoding="utf-8")
+        # ⚠️ 先剥注释再扫，否则注释里的示例代码会被当成真调用（见 strip_block_comments）
+        text = strip_block_comments(path.read_text(encoding="utf-8"))
         lines = text.splitlines()
         varmap = collect_string_vars(lines, macros)
 
         for ln, line in enumerate(lines, 1):
-            if not any(f in line for f in LABEL_FACTORIES):
+            # 找出这一行出现的、我们认识的控件工厂
+            factory = None
+            for name in LABEL_FACTORIES:
+                # 用正则而不是 `in`：`w_label_create_auto(` 里也含
+                # `w_label_create` 这个子串，用 `in` 会把自动字体版也拖进来。
+                # 注意要排除 `w_label_create_auto` 这种后缀变体。
+                if re.search(rf"\b{name}\s*\(", line):
+                    factory = name
+                    break
+            if factory is None:
                 continue
+
+            t_idx, f_idx = LABEL_FACTORIES[factory]
+
             # 可能跨行，拼一个 3 行的窗口
             chunk = " ".join(lines[ln - 1: ln + 2])
-            m = re.search(r"w_label_create\s*\((.*)", chunk, re.S)
+            m = re.search(rf"\b{factory}\s*\((.*)", chunk, re.S)
             if not m:
                 continue
             args = split_args(m.group(1))
-            if len(args) < 4:
+            if len(args) <= max(t_idx, f_idx):
                 continue
-            textarg, fontarg = args[1], args[2]
+            textarg, fontarg = args[t_idx], args[f_idx]
 
             bad_font = [f for f in ASCII_FONTS if re.fullmatch(rf"{f}", fontarg.strip())]
             if not bad_font:
@@ -162,19 +214,19 @@ def main():
 
             chinese, why = looks_chinese(textarg, macros, varmap)
             if chinese:
-                problems.append((path, ln, bad_font[0], textarg, why))
+                problems.append((path, ln, factory, bad_font[0], textarg, why))
 
     if not problems:
         print("✓ 没发现「ASCII 字体 + 可能含中文的文案」的组合")
         return 0
 
-    print("✗ 以下标签用了纯 ASCII 字体，但文案可能含中文 → 屏幕上会是豆腐块：\n")
-    for path, ln, font, textarg, why in problems:
+    print("✗ 以下控件用了纯 ASCII 字体，但文案可能含中文 → 屏幕上会是豆腐块：\n")
+    for path, ln, factory, font, textarg, why in problems:
         rel = path.relative_to(FW)
-        print(f"  {rel}:{ln}   [{font}]")
+        print(f"  {rel}:{ln}   {factory}()  [{font}]")
         print(f"      文案: {textarg}")
         print(f"      依据: {why}")
-        print(f"      → 改成 watch_font_cn(14) / watch_font_cn(16)\n")
+        print(f"      → 改成 watch_font_cn(14) / watch_font_cn(16)，或传 NULL 用默认中文字体\n")
     return 2
 
 

@@ -85,8 +85,18 @@ def main():
     texts = [a for a in sys.argv[1:] if not a.startswith("--")]
 
     if check_all:
-        s = STRINGS.read_text(encoding="utf-8")
-        texts = ["".join(sorted({c for c in s if 0x4E00 <= ord(c) <= 0x9FFF}))]
+        # ⚠️ 只扫**字符串字面量**，和 tools/gen_font.ps1 的口径保持一致。
+        #
+        # 字库是按需抽字的，生成脚本只收「源码里的字符串字面量」，
+        # 所以注释里聊到的中文（"抬腕亮屏""豆腐块""踩过坑"…）本来就不该进字库。
+        #
+        # 早期版本这里读的是**整个文件**（含注释），于是把注释里的字
+        # 也算成"缺字"，一次报出五十多个假阳性 —— 那样这个脚本就没法
+        # 当验收门槛用了（真正有效的门槛是 check_all_literals.py）。
+        s = strip_comments(STRINGS.read_text(encoding="utf-8"))
+        lits = re.findall(r'"((?:[^"\\\n]|\\.)*)"', s)
+        chars = {c for lit in lits for c in lit if 0x4E00 <= ord(c) <= 0x9FFF}
+        texts = ["".join(sorted(chars))]
 
     if not texts:
         print(__doc__)

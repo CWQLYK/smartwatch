@@ -7,6 +7,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include "esp_log.h"
+
+static const char *TAG = "WIDGET";
 
 /* ==================== 容器 ==================== */
 lv_obj_t *w_page_create(lv_obj_t *parent)
@@ -148,11 +151,33 @@ lv_obj_t *w_label_create_auto(lv_obj_t *parent, const char *text,
 /*
  * ==================== 自动字体（防豆腐块） ====================
  *
- * 用一张静态表记住每个标签的"ASCII 字体偏好"。
- * 标签数量是有限且固定的（一个界面几十个），表够用；
- * 表满时降级为"只设中文字体"，不会出错，只是数字不那么好看。
+ * 用一张静态表记住每个标签的"ASCII 字体偏好"：
+ * 内容是数字/英文 → 用 Montserrat（好看）；出现中文 → 自动切中文字库。
+ *
+ * ## ★ v0.5.0 修掉的一个严重 bug（用户实测：部分中文变豆腐块）
+ *
+ * 原来这张表**只增不减**：页面重建（模态 refresh、轮播换页）会把标签删掉，
+ * 但表里的记录还在。于是：
+ *   1. **表很快被占满**（原来只有 24 格）。占满之后 `w_label_set_auto_font()`
+ *      直接 `return` —— 什么都不做（注释还写着"降级为只设中文字体"，是错的）。
+ *      之后新建的标签查不到记录 → `w_label_set_text_auto()` 提前返回
+ *      → 标签保持创建时的 ASCII 字体 → **中文全变豆腐块**。
+ *   2. 更隐蔽：删掉的标签地址会被新标签复用，`find_auto()` 命中**残留记录**，
+ *      于是拿到别的标签的字体偏好。
+ *
+ * 症状之所以是"**部分**中文出问题"，就是因为只有最早那二十几个标签
+ * 抢到了格子。v0.5.0 新增的时钟页每次切标签都重建一整屏控件，
+ * 24 格瞬间见底，问题才暴露出来。
+ *
+ * 三条修法（缺一不可）：
+ *   - 标签被删除时**释放格子**（挂 LV_EVENT_DELETE）
+ *   - 格子数放宽到 64（一条记录才 12 字节，代价可忽略）
+ *   - 查不到记录时**兜底**：内容含中文就直接上中文字体 ——
+ *     宁可字号不理想，也绝不留豆腐块
  */
-#define AUTO_FONT_MAX   24
+#define AUTO_FONT_MAX       64
+/* 查不到记录时兜底用的中文字号（和 watch_font_cn(14) 一致） */
+#define AUTO_CJK_FALLBACK   14
 
 typedef struct {
     lv_obj_t       *label;
@@ -161,6 +186,20 @@ typedef struct {
 } auto_font_t;
 
 static auto_font_t s_auto[AUTO_FONT_MAX];
+
+/** @brief 标签被删除时释放它的格子（否则表会被重建出来的标签撑满） */
+static void auto_font_on_delete(lv_event_t *e)
+{
+    lv_obj_t *lbl = lv_event_get_target(e);
+    for (int i = 0; i < AUTO_FONT_MAX; i++) {
+        if (s_auto[i].label == lbl) {
+            s_auto[i].label      = NULL;
+            s_auto[i].ascii_font = NULL;
+            s_auto[i].cjk_size   = 0;
+            return;
+        }
+    }
+}
 
 void w_label_set_auto_font(lv_obj_t *label, const lv_font_t *ascii_font, int cjk_size)
 {
@@ -181,8 +220,20 @@ void w_label_set_auto_font(lv_obj_t *label, const lv_font_t *ascii_font, int cjk
             s_auto[i].label      = label;
             s_auto[i].ascii_font = ascii_font;
             s_auto[i].cjk_size   = cjk_size;
+            /* 删除时回收格子 —— 这一行是防"表被用满"的关键，别删 */
+            lv_obj_add_event_cb(label, auto_font_on_delete, LV_EVENT_DELETE, NULL);
             return;
         }
+    }
+
+    /*
+     * 表满（正常不会再发生，因为格子会回收）。
+     * 兜底：内容有中文就直接上中文字体，**绝不静默什么都不做**。
+     */
+    ESP_LOGW(TAG, "自动字体表已满（%d 格），本标签改用即时判断", AUTO_FONT_MAX);
+    if (w_text_has_non_ascii(lv_label_get_text(label))) {
+        lv_obj_set_style_text_font(label, watch_font_cn(cjk_size ? cjk_size
+                                                                : AUTO_CJK_FALLBACK), 0);
     }
 }
 
@@ -205,7 +256,19 @@ void w_label_set_text_auto(lv_obj_t *label, const char *text)
 
     const auto_font_t *af = find_auto(label);
     if (!af) {
-        return;                     /* 没登记过就别乱动字体 */
+        /*
+         * 没登记过（不是 w_label_create_auto 造的，或表满降级）。
+         *
+         * ⚠️ 这里**不能直接 return**：那样含中文的文案会保持 ASCII 字体
+         *    → 豆腐块（v0.5.0 用户实测到的就是这个）。
+         *    但也**不能无脑覆盖字体** —— 纯 ASCII 时可能是调用方
+         *    故意设的大号数字字体（如 W_FONT_CLOCK），覆盖了会变小。
+         *    所以只在"内容含中文"时兜底。
+         */
+        if (w_text_has_non_ascii(text)) {
+            lv_obj_set_style_text_font(label, watch_font_cn(AUTO_CJK_FALLBACK), 0);
+        }
+        return;
     }
     lv_obj_set_style_text_font(label,
                                w_text_has_non_ascii(text)
@@ -235,7 +298,17 @@ lv_obj_t *w_label_value_create(lv_obj_t *parent, const char *title,
                                          W_COLOR_TEXT_DIM);
     lv_obj_align(title_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    lv_obj_t *val_lbl = w_label_create(parent, value, W_FONT_MEDIUM, W_COLOR_AUTO);
+    /*
+     * ★ v0.5.0：这里原来是 `w_label_create(parent, value, W_FONT_MEDIUM, ...)` ——
+     *   把字体写死成 Montserrat（只有 ASCII）。而 `value` 完全可能是中文
+     *   （"--未接入"/"开"/"关"），那就是豆腐块。
+     *
+     *   这正是本项目踩过四次的坑（日期格式串 / 设置页值列 / 分隔符 /
+     *   键盘功能键），`tools/check_fonts.py` 也把它报了出来。
+     *   改用 `w_label_create_auto()`：按内容自动选字体，从根上杜绝。
+     */
+    lv_obj_t *val_lbl = w_label_create_auto(parent, value, W_FONT_MEDIUM, 16,
+                                            W_COLOR_AUTO);
     lv_obj_align(val_lbl, LV_ALIGN_LEFT_MID, 0, 8);
 
     return val_lbl;
@@ -417,4 +490,244 @@ void w_set_placeholder(lv_obj_t *label, bool placeholder)
     if (!label) return;
     lv_obj_set_style_text_color(label,
                                placeholder ? W_COLOR_TEXT_MUTE : W_COLOR_ACCENT, 0);
+}
+
+/* ==================================================================
+ * 四、菜单行与大按钮（v0.5.0）
+ * ================================================================== */
+
+lv_obj_t *w_flex_col_create(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                            lv_coord_t w, lv_coord_t h, lv_coord_t gap)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+
+    if (x != W_AUTO_POS || y != W_AUTO_POS) {
+        lv_obj_set_pos(box, x, y);
+    }
+    if (w == W_AUTO_SIZE || h == W_AUTO_SIZE) {
+        lv_obj_set_size(box, (w == W_AUTO_SIZE) ? LV_SIZE_CONTENT : w,
+                        (h == W_AUTO_SIZE) ? LV_SIZE_CONTENT : h);
+    } else {
+        lv_obj_set_size(box, w, h);
+    }
+
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(box, 0, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_set_style_pad_row(box, gap, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
+    /* 不滚动、不抢事件 —— 和 w_card_create 同样的理由：
+     * 一旦 scroll_dir 不是 NONE，拖动会被它当成"滚这个容器"吃掉，
+     * 外层轮播就收不到滚动（表现为"划不动"）。 */
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(box, LV_DIR_NONE);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+
+    return box;
+}
+
+lv_obj_t *w_menu_row_create(lv_obj_t *parent, const char *title, const char *sub,
+                            lv_event_cb_t cb)
+{
+    lv_obj_t *card = w_card_create_clickable(parent, W_AUTO_POS, W_AUTO_POS,
+                                             LV_PCT(100), 52);
+
+    lv_obj_t *t = w_label_create(card, title, watch_font_cn(16), W_COLOR_TEXT);
+    if (sub) {
+        lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, 2);
+        lv_obj_t *s = w_label_create(card, sub, watch_font_cn(14), W_COLOR_TEXT_DIM);
+        lv_obj_align(s, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    } else {
+        lv_obj_align(t, LV_ALIGN_LEFT_MID, 0, 0);
+    }
+
+    /* 右箭头提示"可以点进去" */
+    lv_obj_t *a = w_label_create(card, ">", W_FONT_SMALL, W_COLOR_ACCENT);
+    lv_obj_align(a, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    if (cb) {
+        lv_obj_add_event_cb(card, cb, LV_EVENT_CLICKED, NULL);
+    }
+    return card;
+}
+
+lv_obj_t *w_btn_create(lv_obj_t *parent, const char *text,
+                       lv_coord_t w, lv_coord_t h,
+                       lv_color_t bg, lv_color_t fg,
+                       const lv_font_t *font, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+
+    lv_obj_set_size(b, (w == W_AUTO_SIZE) ? LV_PCT(100) : w, h ? h : 48);
+    lv_obj_set_style_radius(b, W_RADIUS_BTN, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_border_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b,
+                              (bg.full == W_COLOR_AUTO.full) ? W_COLOR_CARD : bg, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    /* 按下时压暗一点，手指有反馈 */
+    lv_obj_set_style_bg_color(b, W_COLOR_CARD_HI, LV_STATE_PRESSED);
+
+    lv_obj_t *l = w_label_create(b, text, font ? font : watch_font_cn(16),
+                                 (fg.full == W_COLOR_AUTO.full) ? W_COLOR_TEXT : fg);
+    lv_obj_center(l);
+
+    if (cb) {
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    }
+    return b;
+}
+
+/* ==================================================================
+ * 标签栏（分段按钮）
+ *
+ * ## 为什么不用 lv_btnmatrix（v0.5.0 换掉的）
+ *
+ * 第一版用的是 `lv_btnmatrix`：它原生支持"同时只有一个选中"，
+ * 看起来很合适。但实测（PC 模拟器截图）**4 个标签被画成了一个大按钮**，
+ * 而且踩到两个坑：
+ *
+ *   1. `lv_btnmatrix_set_map()` **只存指针、不拷贝字符串**
+ *      （lv_btnmatrix.c:102 `btnm->map_p = map;`）。
+ *      用复合字面量 `(const char *[]){ labels, "" }` 传进去，
+ *      函数返回后数组就没了 → 悬空指针 → 访问违例崩溃。
+ *      （这个模拟器自检直接抓到了。）
+ *   2. 靠 `\n` 分隔按钮、靠 ctrl 位图表示"可选中/已选中/宽度"，
+ *      这些隐式约定很容易出错，而画出来的东西**不对也不报错**。
+ *
+ * 所以换成最直白的做法：**N 个普通按钮 + flex 等宽平分**，
+ * 选中态自己维护（改背景色 + 字色）。
+ * 代价是多十几行，换来的是"所见即所得、出错一眼能看出来"。
+ *
+ * ⚠️ 同一时刻只支持一个标签栏（全项目只有时钟页用）。
+ *    要支持多个的话，得把状态挂到容器上而不是用这个静态实例。
+ * ================================================================== */
+#define W_TABBAR_MAX   4
+#define W_TABBAR_GAP   4
+#define W_TABBAR_H     32
+
+typedef struct {
+    lv_obj_t     *cont;
+    lv_obj_t     *btn[W_TABBAR_MAX];
+    lv_obj_t     *lbl[W_TABBAR_MAX];
+    int           count;
+    int           active;
+    w_tabbar_cb_t cb;
+    void         *user;
+} w_tabbar_t;
+
+static w_tabbar_t s_tabbar;
+
+/** @brief 应用选中态（改颜色） */
+static void tabbar_apply(int idx)
+{
+    if (idx < 0 || idx >= s_tabbar.count) {
+        return;
+    }
+    s_tabbar.active = idx;
+    for (int i = 0; i < s_tabbar.count; i++) {
+        const bool on = (i == idx);
+        lv_obj_set_style_bg_color(s_tabbar.btn[i],
+                                  on ? W_COLOR_ACCENT : W_COLOR_CARD, 0);
+        lv_obj_set_style_bg_opa(s_tabbar.btn[i], LV_OPA_COVER, 0);
+        /* 字色必须设在**标签**上：创建时给了显式颜色，
+         * 显式样式会盖过从按钮继承来的颜色。 */
+        lv_obj_set_style_text_color(s_tabbar.lbl[i],
+                                    on ? W_COLOR_BG : W_COLOR_TEXT_DIM, 0);
+    }
+}
+
+static void tabbar_click_cb(lv_event_t *e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx == s_tabbar.active) {
+        return;                     /* 点的是当前页，不折腾 */
+    }
+    tabbar_apply(idx);
+
+    if (s_tabbar.cb) {
+        s_tabbar.cb(idx, s_tabbar.user);
+    }
+}
+
+lv_obj_t *w_tabbar_create(lv_obj_t *parent, const char *labels, uint16_t active,
+                          w_tabbar_cb_t cb, void *user)
+{
+    memset(&s_tabbar, 0, sizeof(s_tabbar));
+    s_tabbar.cb   = cb;
+    s_tabbar.user = user;
+    s_tabbar.active = -1;
+
+    /* 先按 '\n' 数一下有几项，才能算等宽 */
+    char tmp[W_TABBAR_MAX][24];
+    int n = 0;
+    {
+        const char *p = labels ? labels : "";
+        while (*p && n < W_TABBAR_MAX) {
+            int k = 0;
+            while (*p && *p != '\n' && k < (int)sizeof(tmp[0]) - 1) {
+                tmp[n][k++] = *p++;
+            }
+            tmp[n][k] = '\0';
+            n++;
+            if (*p == '\n') {
+                p++;
+            }
+        }
+    }
+    if (n == 0) {
+        return NULL;
+    }
+
+    lv_obj_t *row = w_flex_col_create(parent, W_AUTO_POS, W_AUTO_POS,
+                                      LV_PCT(100), W_TABBAR_H, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, W_TABBAR_GAP, 0);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    s_tabbar.cont = row;
+
+    const lv_coord_t w = (216 - (n - 1) * W_TABBAR_GAP) / n;
+
+    for (int i = 0; i < n; i++) {
+        lv_obj_t *b = lv_btn_create(row);
+        lv_obj_set_size(b, w, W_TABBAR_H);
+        lv_obj_set_style_radius(b, W_RADIUS_BTN, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_set_style_border_width(b, 0, 0);
+        lv_obj_set_style_bg_color(b, W_COLOR_CARD, 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+
+        lv_obj_t *l = w_label_create(b, tmp[i], watch_font_cn(14),
+                                     W_COLOR_TEXT_DIM);
+        lv_obj_center(l);
+
+        lv_obj_add_event_cb(b, tabbar_click_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        s_tabbar.btn[i] = b;
+        s_tabbar.lbl[i] = l;
+    }
+    s_tabbar.count = n;
+
+    tabbar_apply((active < (uint16_t)n) ? (int)active : 0);
+    return row;
+}
+
+int w_tabbar_set_active(uint16_t idx)
+{
+    if (s_tabbar.count <= 0 || idx >= (uint16_t)s_tabbar.count) {
+        return -1;
+    }
+    if ((int)idx != s_tabbar.active) {
+        tabbar_apply((int)idx);
+    }
+    return 0;
+}
+
+int w_tabbar_active(void)
+{
+    return s_tabbar.count > 0 ? s_tabbar.active : -1;
 }

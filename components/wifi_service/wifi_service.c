@@ -247,6 +247,58 @@ static void set_state(wifi_state_t st)
     unlock();
 }
 
+/*
+ * ==================================================================
+ * v0.5.0 新增的两个内部标志
+ * ==================================================================
+ *
+ * s_conn_used_saved
+ *   本次连接用的密码是**从 NVS 回填的**（而不是用户刚输入的）。
+ *   连接失败时要靠它决定"要不要把保存的凭据清掉"—— 用户明确要求：
+ *   「如果连接已经保存的 wifi 连接失败，直接自动取消保存，
+ *     避免 wifi 密码修改导致无法取消保存 WiFi」。
+ *   只有"用的是保存的密码"才清；用户刚手输的密码连不上，
+ *   不该把旧的保存记录也无辜删掉（那种情况本来也没保存）。
+ *
+ * s_user_disconnect
+ *   本次断开是**用户主动点的**（断开连接 / 取消保存 / 扫描自救）。
+ *   用来避免两个误判：
+ *     1. 把用户主动断开当成"连接失败"，界面显示"连接失败"
+ *     2. 用户主动断开时触发"自动取消保存"（那会把密码也删了，
+ *        而"断开连接"的语义是**保留**密码）
+ */
+static volatile bool s_conn_used_saved  = false;
+static volatile bool s_user_disconnect  = false;
+
+/**
+ * @brief 这次失败是不是"认证类"的（值得清掉保存的密码）
+ *
+ * 为什么要区分（而不是"任何失败都清"）：
+ *   走到信号范围外、路由器关机，也会失败，但那些**和密码无关** ——
+ *   那时候把密码删掉，回家还得重新输一遍，体验很差。
+ *   所以只对"一看就是认证/握手问题"的 reason 自动清理；
+ *   纯粹"找不到 AP"的两种 reason 保留凭据。
+ *
+ * reason 码（ESP-IDF）：
+ *   2   AUTH_EXPIRE              认证过期（密码错最常见）
+ *   4   ASSOC_EXPIRE             关联过期
+ *   15  4WAY_HANDSHAKE_TIMEOUT   四次握手超时（密码错典型）
+ *   202 AUTH_FAIL                认证失败
+ *   203 ASSOC_FAIL               关联失败
+ *   204 HANDSHAKE_TIMEOUT        握手超时
+ *   211 NO_AP_FOUND_W_COMPATIBLE_SECURITY  加密方式不兼容（等于连不上）
+ *   —— 保留：200 BEACON_TIMEOUT / 201 NO_AP_FOUND（纯粹没找到 AP）
+ */
+static bool reason_is_auth(int reason)
+{
+    switch (reason) {
+    case 2: case 4: case 15: case 202: case 203: case 204: case 211:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
@@ -265,23 +317,67 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         case WIFI_EVENT_STA_DISCONNECTED: {
             const wifi_event_sta_disconnected_t *d =
                 (const wifi_event_sta_disconnected_t *)data;
-            ESP_LOGW(TAG, "断开（reason=%d）", d ? d->reason : -1);
+            const int reason = d ? d->reason : -1;
+            ESP_LOGW(TAG, "断开（reason=%d）", reason);
             /* 通知正在等"断开完成"的 connect 流程 */
             if (s_disc_sem) {
                 xSemaphoreGive(s_disc_sem);
             }
 
+            /* ---------- 情况一：用户主动断开 ---------- */
+            if (s_user_disconnect) {
+                s_user_disconnect = false;
+                /*
+                 * ★ 不要把状态改成 FAILED。
+                 *   否则用户点"断开连接"之后，界面会显示"连接失败（密码错…）"，
+                 *   而实际上这正是他想要的结果。保持 IDLE。
+                 */
+                ESP_LOGI(TAG, "（用户主动断开，保持未连接状态）");
+                lock();
+                s_st.state = W_WIFI_IDLE;
+                s_st.rssi  = 0;
+                s_st.ip[0] = '\0';
+                unlock();
+                break;
+            }
+
+            /* ---------- 情况二：连接尝试失败 ---------- */
             lock();
             s_st.state = W_WIFI_FAILED;
             s_st.rssi  = 0;
             s_st.ip[0] = '\0';
+            unlock();
+
+            /*
+             * ★ 用"已保存的密码"连接失败 -> 自动清掉保存的凭据。
+             *
+             * 用户要求的场景：路由器改了 WiFi 密码，手表里存着旧密码，
+             * 于是永远连不上；而界面上能做的只有"重新扫描"，
+             * 点了还是拿旧密码去连 —— 等于卡死，没法翻身。
+             *
+             * 清掉之后：界面下次点这个网络会**直接问密码**，就能救回来了。
+             *
+             * 只清"认证类"失败（见 reason_is_auth 的说明）：
+             * 走到没信号的地方导致的失败不该把密码删掉。
+             */
+            if (s_conn_used_saved && reason_is_auth(reason)) {
+                ESP_LOGW(TAG, "用已保存的密码连接失败（reason=%d）-> "
+                              "清除保存的凭据，下次会重新询问密码", reason);
+                creds_erase();
+                lock();
+                s_st.auto_reconnect = false;
+                s_st.ssid[0]        = '\0';
+                s_st.creds_cleared  = true;
+                unlock();
+            }
+            s_conn_used_saved = false;
+
             /*
              * 注意：**不在这里无限重连**。
              * 用户明确要求"提供手动断开"，无脑重连会和它打架
              * （刚点完断开，它 1 秒后又自己连上，用户会以为按钮坏了）。
              * 自动重连只在开机 init 时做一次。
              */
-            unlock();
             break;
         }
 
@@ -365,6 +461,13 @@ static void wifi_force_idle(const char *why)
     if (s_disc_sem) {
         xSemaphoreTake(s_disc_sem, 0);
     }
+    /*
+     * 这是我们自己（超时自救 / 扫描前清理）主动断的，不是连接失败：
+     * 打上标志，免得事件回调把状态改成 FAILED、
+     * 更免得触发"用保存的密码失败 -> 清凭据"那条逻辑。
+     */
+    s_user_disconnect = true;
+    s_conn_used_saved = false;
     esp_wifi_disconnect();
     if (s_disc_sem) {
         if (xSemaphoreTake(s_disc_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
@@ -485,6 +588,7 @@ static int hook_connect(const char *ssid, const char *password)
      *   这两种情况下正确行为都是"用已保存的密码重连"。
      */
     char eff_pass[WIFI_PASS_MAX] = { 0 };
+    bool from_saved = false;            /* 密码是不是从 NVS 回填的 */
     if (password && password[0]) {
         strncpy(eff_pass, password, sizeof(eff_pass) - 1);
     } else {
@@ -495,12 +599,67 @@ static int hook_connect(const char *ssid, const char *password)
                        saved_pass, sizeof(saved_pass)) == ESP_OK &&
             saved_ssid[0] && strcmp(saved_ssid, ssid) == 0) {
             strncpy(eff_pass, saved_pass, sizeof(eff_pass) - 1);
+            from_saved = true;
             ESP_LOGI(TAG, "使用已保存的密码重连 '%s'（%d 位）",
                      ssid, (int)strlen(eff_pass));
         } else {
             ESP_LOGW(TAG, "'%s' 没有对应的已保存密码，按开放网络处理", ssid);
         }
     }
+
+    /*
+     * ==============================================================
+     * ★ v0.5.0：拒绝"加密网络 + 空密码"这种**必然失败**的组合
+     * ==============================================================
+     *
+     * 用户实测报的问题："连接 CWQLYK 失败，提示密码错误，
+     * 但之前保存的密码是正确的。"
+     *
+     * 根因是 NVS 里那条记录变成了 `ssid="CWQLYK", pass=""`：
+     *   · 界面看"已保存" -> 直接 connect(ssid, NULL)（不问密码）
+     *   · 这里回填出空密码 -> cfg.sta.password 是空的
+     *   · 驱动按"开放网络"去连一个 WPA2/WPA3 的 AP
+     *     -> 认证失败 reason=2 -> 界面显示"密码错误"
+     *
+     * 而空密码是怎么写进去的（v0.4.0 的遗留路径，本次一并堵上）：
+     *   原来无论有没有密码，最后都会 `creds_save(ssid, eff_pass)` ——
+     *   eff_pass 为空时就把空串存了进去（下一处注释有详细说明）。
+     *
+     * 现在的处理：**先判断这个 SSID 在扫描结果里是不是加密的**，
+     * 加密 + 没密码 -> 不发起连接，直接把这条坏记录清掉，
+     * 并明确告诉用户。这样"点一下就能重新输密码"，不会卡死。
+     */
+    if (!eff_pass[0]) {
+        bool known_secure = false;
+        bool known_open   = false;
+        lock();
+        for (int i = 0; i < s_ap_count; i++) {
+            if (strcmp(s_aps[i].ssid, ssid) == 0) {
+                known_secure = s_aps[i].secure;
+                known_open   = !s_aps[i].secure;
+                break;
+            }
+        }
+        unlock();
+
+        if (known_secure) {
+            ESP_LOGE(TAG, "'%s' 是加密网络但没有可用密码（保存的凭据已损坏/为空）"
+                          " -> 不发起连接，清除这条坏记录，请重新输入密码", ssid);
+            creds_erase();
+            lock();
+            s_st.state          = W_WIFI_FAILED;
+            s_st.auto_reconnect = false;
+            s_st.ssid[0]        = '\0';
+            s_st.creds_cleared  = true;
+            unlock();
+            return -1;
+        }
+        if (!known_open) {
+            /* 还没扫描过，判断不了 —— 允许试一次，但下面不会把空密码存进 NVS */
+            ESP_LOGW(TAG, "'%s' 不在扫描结果里，无法判断是否加密，按开放网络试连", ssid);
+        }
+    }
+
     if (eff_pass[0]) {
         strncpy((char *)cfg.sta.password, eff_pass, sizeof(cfg.sta.password) - 1);
     }
@@ -540,10 +699,15 @@ static int hook_connect(const char *ssid, const char *password)
 
     lock();
     snprintf(s_st.ssid, sizeof(s_st.ssid), "%s", ssid);
-    s_st.state       = W_WIFI_CONNECTING;
-    s_st.time_synced = false;
-    s_st.conn_start  = (uint32_t)(esp_timer_get_time() / 1000);
+    s_st.state         = W_WIFI_CONNECTING;
+    s_st.time_synced   = false;
+    s_st.creds_cleared = false;         /* 新一轮尝试，清掉上次的提示 */
+    s_st.conn_start    = (uint32_t)(esp_timer_get_time() / 1000);
     unlock();
+
+    /* 记下"这次用的是不是保存的密码" —— 失败时据此决定要不要清凭据 */
+    s_conn_used_saved = from_saved;
+    s_user_disconnect = false;
 
     /*
      * ★ 关键：先断开、等断开完成，再设配置。
@@ -558,6 +722,13 @@ static int hook_connect(const char *ssid, const char *password)
     if (s_disc_sem) {
         xSemaphoreTake(s_disc_sem, 0);      /* 清掉可能残留的信号 */
     }
+    /*
+     * ★ 这次断开是**我们自己为了改配置而做的**，不是连接失败。
+     *   必须打上"主动断开"标志，否则紧接着到达的 STA_DISCONNECTED
+     *   会被当成"用保存的密码连接失败"，直接把我们刚要用的凭据清掉 ——
+     *   那就会变成"永远在清密码、永远连不上"。
+     */
+    s_user_disconnect = true;
     esp_wifi_disconnect();
     if (s_disc_sem) {
         /* 等断开事件，最多 2 秒。超时也继续 —— 宁可试一次也不要死等 */
@@ -600,11 +771,54 @@ static int hook_connect(const char *ssid, const char *password)
      *    入参可能是空的（用户点已保存的网络重连、或串口省略密码），
      *    存空串会把 NVS 里原本好好的密码**覆盖掉**，
      *    下次开机就再也自动连不上了。
+     *
+     * ★ v0.5.0 又补了一层：**空密码根本不写 NVS**。
+     *
+     *   上面那条规则只管"用哪个变量"，没管"空的时候要不要写" ——
+     *   于是在"没有已保存密码、又按开放网络去连"的路径上，
+     *   仍然会把 `ssid + ""` 写进去。用户实测就是这么坏的：
+     *   NVS 里留下 `CWQLYK + 空密码`，界面看着"已保存"就不再问密码，
+     *   而实际连接必然认证失败（reason=2），提示"密码错误"，
+     *   用户怎么试都救不回来。
+     *
+     *   现在的规则：
+     *     · 有密码            -> 存（正常路径）
+     *     · 没密码 + 确认是开放网络 -> 存 SSID（开放网络本来就没密码，
+     *                              留着图个开机自动重连）
+     *     · 没密码 + 不确定/是加密的 -> **不写**，并清掉可能存在的坏记录
+     *       （"不确定"就是没扫描过、判断不了，宁可不记住也别存坏的）
      */
-    creds_save(ssid, eff_pass);
-    lock();
-    s_st.auto_reconnect = true;
-    unlock();
+    if (eff_pass[0]) {
+        creds_save(ssid, eff_pass);
+        lock();
+        s_st.auto_reconnect = true;
+        unlock();
+    } else {
+        bool ap_is_open = false;
+        lock();
+        for (int i = 0; i < s_ap_count; i++) {
+            if (strcmp(s_aps[i].ssid, ssid) == 0 && !s_aps[i].secure) {
+                ap_is_open = true;
+                break;
+            }
+        }
+        unlock();
+
+        if (ap_is_open) {
+            creds_save(ssid, "");
+            lock();
+            s_st.auto_reconnect = true;
+            unlock();
+            ESP_LOGI(TAG, "'%s' 是开放网络，只记 SSID 不记密码", ssid);
+        } else {
+            /* 不清 NVS：万一是"没扫描过"的情况，别误删别的网络的好密码。
+             * 只保证不把空密码写进去。 */
+            ESP_LOGW(TAG, "'%s' 无密码且未确认为开放网络 -> 不写入 NVS", ssid);
+            lock();
+            s_st.auto_reconnect = false;
+            unlock();
+        }
+    }
 
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK) {
@@ -629,6 +843,15 @@ static int hook_disconnect(void)
     if (!s_started) {
         return -1;
     }
+    /*
+     * ★ 先打"主动断开"标志再断。
+     *   否则 STA_DISCONNECTED 事件会被当成"连接失败"处理：
+     *   状态变 FAILED（界面显示"连接失败（密码错或信号太差）"），
+     *   而且如果这次连接用的是保存的密码，还会触发"自动取消保存"——
+     *   可用户点的是"断开连接"，语义是**保留**密码。
+     */
+    s_user_disconnect = true;
+    s_conn_used_saved = false;
     esp_wifi_disconnect();
 
     lock();
@@ -652,6 +875,8 @@ static int hook_forget(void)
     if (!s_started) {
         return -1;
     }
+    s_user_disconnect = true;       /* 同上：这是用户主动行为，不是失败 */
+    s_conn_used_saved = false;
     esp_wifi_disconnect();
     creds_erase();
 
@@ -665,6 +890,7 @@ static int hook_forget(void)
     s_st.syncing        = false;
     s_st.sync_failed    = false;
     s_st.conn_start     = 0;
+    s_st.creds_cleared  = false;    /* 是我们自己清的，不用提示"已自动清除" */
     unlock();
 
     ESP_LOGI(TAG, "已断开并清除保存的密码");
@@ -801,6 +1027,8 @@ esp_err_t wifi_service_reset(void)
     ESP_LOGW(TAG, "重置 WiFi 驱动（deinit + init）…");
 
     if (s_started) {
+        s_user_disconnect = true;       /* 主动重置，不是连接失败 */
+        s_conn_used_saved = false;
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_wifi_stop();

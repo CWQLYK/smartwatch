@@ -60,6 +60,24 @@ CONFIG_LV_FONT_MONTSERRAT_40=y
 # Keep this OFF so the build never tries to glob them.
 CONFIG_LV_BUILD_EXAMPLES=n
 
+# Roller infinite-mode pages.
+#
+# The wheel picker (components/watch_ui/watch_wheel.c) uses lv_roller in
+# LV_ROLLER_MODE_INFINITE. That mode repeats the option string INF_PAGES
+# times inside the roller's label (lv_roller.c:122-130), so the label height
+# is options x pages x line_pitch.
+#
+# Our minute/second rollers have 60 options. With the default 7 pages and a
+# ~38 px line pitch that is 15960 px -- but with LV_USE_LARGE_COORD=0,
+# lv_coord_t is int16 and LV_COORD_MAX is 8191, so the label height gets
+# CLAMPED. Symptom: the number inside the highlight box is not the option
+# that is actually selected (measured: selected 02 displayed as 17).
+#
+# 3 pages x 60 options x 30 px = 5400 px, comfortably under the limit.
+# MUST match LV_ROLLER_INF_PAGES in lvgl_sim/lv_conf.h, otherwise the
+# simulator and the device behave differently.
+CONFIG_LV_ROLLER_INF_PAGES=3
+
 # ==================== Partition table ====================
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

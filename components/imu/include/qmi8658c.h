@@ -230,10 +230,21 @@ typedef struct {
     int32_t  commit_after;        /* 攒够几个间隔才确认计步 */
     int32_t  cadence_min_spm;     /* 合理步频范围 */
     int32_t  cadence_max_spm;
-    /* ---- 距离 / 卡路里所需的用户参数 ---- */
-    uint16_t user_height_cm;
+    /* ---- 步长 / 卡路里所需的参数 ----
+     *
+     * ★ v0.5.0 起**步长是固定值**，不再按身高推算：
+     *     走路 50cm、跑步 90cm（用户明确给定）。
+     *   原来那套 `0.43 × 身高 + 步频微调` 的经验式在实测中明显偏大
+     *   （180cm 身高算出 180cm 步长 = 等于身高），已废弃。
+     *
+     *   以后要做个体标定（走一段量过的路反算步长），
+     *   改这两个字段即可，别再把身高乘系数那套加回来。
+     */
+    uint16_t stride_walk_cm;      /* 走路步长，默认 50 */
+    uint16_t stride_run_cm;       /* 跑步步长，默认 90 */
+    /* 卡路里：体重仍参与计算，但设置里已不再暴露（用户要求删掉体重设置项）。
+     * app 层用固定常量填进来，以后"卡路里"功能开发回来时接真实体重即可。 */
     uint16_t user_weight_kg;
-    uint8_t  user_is_male;
 } step_config_t;
 
 /** @brief 计步输出状态 */
@@ -431,15 +442,20 @@ static inline int32_t qmi8658_gyro_raw_to_mdps(int16_t raw, qmi8658_gfs_t fs)
  * 四、计步 API
  * ================================================================== */
 
-/** @brief 初始化计步器；cfg 传 NULL 用内置起始参数 */
+/** @brief 初始化计步器；cfg 传 NULL 用内置默认参数 */
 void step_counter_init(step_counter_t *sc, const step_config_t *cfg);
 
 /** @brief 设定（或重启）带通建立窗口：now_ms + 600ms 内不计步 */
 void step_counter_settle(step_counter_t *sc, uint32_t now_ms);
 
-/** @brief 设置用户身高/体重/性别（用于步长与卡路里） */
-void step_counter_set_user(step_counter_t *sc, uint16_t height_cm,
-                           uint16_t weight_kg, bool is_male);
+/**
+ * @brief 设置卡路里计算用的体重（kg）
+ *
+ * @note v0.5.0 起步长是固定值（走路 50cm / 跑步 90cm），
+ *       身高和性别不再需要，所以这个接口只剩体重一个参数。
+ *       旧名 `step_counter_set_user(height, weight, is_male)` 已删除。
+ */
+void step_counter_set_weight(step_counter_t *sc, uint16_t weight_kg);
 
 /**
  * @brief 喂一个加速度样本

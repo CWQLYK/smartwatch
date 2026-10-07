@@ -234,19 +234,24 @@ int watch_ui_debug_page_scroll(void);
 
 /* ==================================================================
  * 四、内置页面（定义在 watch_ui_pages 组件里）
+ *
+ * ★ v0.5.0 起轮播只有 4 页，顺序 = watch_pages_all.c 里的数组顺序：
+ *      时间 → 运动 → 健康 → 功能列表
+ *   原来的"设置"不再是轮播页，改成功能列表里的模态子页
+ *   （入口 `watch_settings_open()`，声明在下面第五节）。
  * ================================================================== */
 
-/** @brief 表盘：时间 / 日期 / 星期 / 电量（P1 功能 3、4） */
+/** @brief 时间页（原"表盘"）：时间 / 日期 / 星期 / 电量 / 步数 */
 extern const watch_page_t watch_page_home;
 
-/** @brief 设置页 */
-extern const watch_page_t watch_page_settings;
+/** @brief 运动页：步数 / 距离（卡路里卡 v0.5.0 暂时去掉） */
+extern const watch_page_t watch_page_sport;
 
 /** @brief 健康页（P4 做心率，本轮占位） */
 extern const watch_page_t watch_page_health;
 
-/** @brief 运动页（P1 功能 6/7 计步） */
-extern const watch_page_t watch_page_sport;
+/** @brief 功能列表页：设置 / 时钟 / WiFi 连接 / 开发人员选项 */
+extern const watch_page_t watch_page_functions;
 
 /** @brief 获取所有内置页面的注册表（NULL 结尾） */
 const watch_page_t *const *watch_pages_all(void);
@@ -310,12 +315,27 @@ void watch_ui_set_setting_hooks(watch_setting_get_fn get_fn,
  * @note 这些名字由 app 层映射到真正的 NVS 设置项
  *       （见 components/app/app.c 的 settings 适配）。
  *       加新设置项：这里加一个键名 + app 层加一行映射。
+ *
+ * ★ v0.5.0 删除了三个键名（连同 settings 里的枚举和 NVS 键一起）：
+ *     wrist_wake  —— 抬腕亮屏功能取消（用户明确要求）
+ *     height      —— 步长改为固定 50cm/90cm，不再按身高推算
+ *     weight      —— 体重设置项删除（卡路里改用内部固定体重 65kg）
  */
 #define W_SETTING_AUTO_SCREEN  "auto_screen"   /* 自动息屏秒数，0=常亮 */
-#define W_SETTING_WRIST_WAKE   "wrist_wake"    /* 抬腕亮屏 0/1 */
 #define W_SETTING_STEP_GOAL    "step_goal"     /* 每日步数目标 */
-#define W_SETTING_HEIGHT       "height"        /* 身高 cm */
-#define W_SETTING_WEIGHT       "weight"        /* 体重 kg */
+
+/* ---------- v0.5.0 新增：时钟服务要持久化的 5 项 ----------
+ *
+ * 时钟服务（watch_clock.c）跑在 watch_ui 里，**不能 include settings.h**
+ * （那会把 ESP-IDF 依赖带进来，PC 模拟器就编不过了）。
+ * 所以它读写 NVS 也走这套"按名字寻址"的钩子，
+ * 由 app.c 的 setting_get/setting_set 映射到真正的 SETTINGS_* 枚举。
+ */
+#define W_SETTING_ALARM_HOUR   "alarm_hour"    /* 闹钟-时 0-23 */
+#define W_SETTING_ALARM_MIN    "alarm_min"     /* 闹钟-分 0-59 */
+#define W_SETTING_ALARM_EN     "alarm_en"      /* 闹钟开关 0/1 */
+#define W_SETTING_CD_PRESET    "cd_preset"     /* 倒计时时长(秒) */
+#define W_SETTING_CD_RING      "cd_ring"       /* 倒计时响铃时长(秒) */
 
 /** @brief 读设置项（钩子没接时返回 def） */
 int watch_ui_setting_get(const char *key, int def);
@@ -325,14 +345,52 @@ int watch_ui_setting_set(const char *key, int value);
 
 
 /* ==================================================================
- * 子页面入口（设置页调用）
+ * 子页面入口（功能列表页 / 设置页调用）
  *
  * 这些**不是轮播页**，而是盖在轮播上的模态子页（见 watch_modal.h）。
- * 声明集中放这里，是为了让设置页只 include 一个头文件。
+ * 声明集中放这里，是为了让页面只 include 一个头文件。
+ *
+ * ★ v0.5.0 的页面结构：
+ *
+ *     轮播 4 页：  时间(表盘) → 运动 → 健康 → 功能列表
+ *
+ *     功能列表
+ *     ├── 设置      → watch_settings_open()   （亮度/自动息屏/步数目标/时钟状态）
+ *     ├── 时钟      → watch_clock_open()      （标签栏：时间/秒表/倒计时/闹钟）
+ *     ├── WiFi 连接 → watch_wifi_open()       （已有）
+ *     └── 开发人员选项 → watch_developer_open_menu()（IMU录制/系统信息/蜂鸣器测试）
  * ================================================================== */
+
+/** @brief 打开"设置"子页 */
+void watch_settings_open(void);
+
+/** @brief 打开"时钟"子页（内含 4 个标签） */
+void watch_clock_open(void);
+
+/**
+ * @brief 调试/自检用：切换时钟页的标签（0=时间 1=秒表 2=倒计时 3=闹钟）
+ *
+ * @return true = 切换成功（时钟页开着且下标合法）
+ *
+ * @note 时钟页没开时返回 false。给 PC 模拟器自检用来把 4 个标签的
+ *       构建 + 渲染都跑一遍 —— 这是新 UI 里最容易出问题的部分。
+ */
+bool watch_clock_debug_select_tab(int tab);
+
+/** @brief 打开"手动校时"子页（时钟 > 时间 里进入；填 UTC） */
+void watch_time_set_open(void);
 
 /** @brief 打开"开发人员选项"菜单 */
 void watch_developer_open_menu(void);
+
+/**
+ * @brief 直接打开"蜂鸣器测试"子页
+ *
+ * @note 菜单行点进去走的是同一个入口。单独导出是为了：
+ *       · PC 模拟器自检可以直接把它开起来截图
+ *       · 以后串口加个 `buzzer` 测试命令也方便
+ */
+void watch_developer_open_buzzer(void);
 
 /**
  * @brief 取当前 UTC 时间戳（界面层拿时间的唯一途径）
@@ -340,8 +398,34 @@ void watch_developer_open_menu(void);
  * @return Unix 时间戳；RTC 没校过时返回 0
  *
  * @note 界面层不许用 time.h，所以时间统一从这里问。
+ *       ⚠️ 口径提醒：RTC 里存的是**墙上时间**（见 data_hub.c 顶部约定），
+ *          所以这个函数算出来的其实是"把墙上时间当成 UTC 表示的 epoch"。
+ *          闹钟/倒计时比较时间请直接用 `watch_state_t.time` 的
+ *          hour/minute（同样是墙上时间），别跟这里绕。
  */
 uint32_t watch_ui_current_epoch(void);
+
+/**
+ * @brief 当前时间是否已校准（RTC 有没有掉过电）
+ *
+ * @note 模态子页（设置/时钟…）**拿不到** `watch_state_t` ——
+ *       数据变更回调只发给轮播页。但它们要显示"时钟状态"，
+ *       所以这里开一个直接查询的口子。
+ *
+ * @return true = 时间有效；false = 未校准（界面应显示"掉电丢失，待校时"）
+ */
+bool watch_ui_time_valid(void);
+
+/**
+ * @brief 取当前墙上时间的完整快照（模态子页用）
+ *
+ * @param out 输出；`out->valid == false` 表示 RTC 未校准
+ * @return true = 时间有效
+ *
+ * @note 模态子页拿不到 watch_state_t（数据变更回调只发给轮播页），
+ *       但"时钟 > 时间"栏要显示年月日时分秒，所以开这个口子。
+ */
+bool watch_ui_now(watch_time_t *out);
 
 /** @brief 打开"WiFi 连接"页 */
 void watch_wifi_open(void);
