@@ -1,6 +1,6 @@
 /**
  * @file watch_page_functions.c
- * @brief 功能列表页 —— 轮播第 4 页（v0.5.0 新增）
+ * @brief 功能列表页 —— 轮播第 4 页（v0.5.0 新增，v0.6.0 加第 5 行）
  *
  * ## 为什么加这一页
  *
@@ -8,7 +8,7 @@
  * 一页 9 行、内容 450px，屏幕只有 280px，用户得滚半天才够得着最下面
  * （踩过坑，见 v0.4.0 文档「设置页滚不动」）。
  *
- * v0.5.0 按用户要求重排：
+ * v0.5.0 按用户要求重排，v0.6.0 又加了「游戏」：
  *
  *     ┌──────────────────────────┐
  *     │ 功能列表                  │
@@ -20,12 +20,27 @@
  *     │ │ WiFi 连接         >  │ │  扫描连接并自动校时
  *     │ ├──────────────────────┤ │
  *     │ │ 开发人员选项      >  │ │  录制 / 系统信息 / 蜂鸣器
+ *     │ ├──────────────────────┤ │
+ *     │ │ 游戏              >  │ │  小恐龙，玩一局   ← v0.6.0
  *     │ └──────────────────────┘ │
  *     └──────────────────────────┘
  *
- * ⚠️ 本页是**轮播页**，页面根不可滚动（见 w_page_create 的说明）：
- *    所以内容必须 ≤ 一屏。4 行 × 52 + 3 × 6 间隙 = 226，
- *    加上标题 32 共 258 < 280，刚好放得下 —— 再加行就要溢出够不着了。
+ * ## ⚠️ 这一页现在是**可纵向滚动**的（v0.6.0 起）
+ *
+ * 5 行 x 52 + 4 x 6 间隙 = 284，加标题 32 共 316，比 280 高 —— 装不下了。
+ * 用户明确选择"保持 52px 行高、允许上下滑动"，所以：
+ *
+ *   · 一屏只能看到前 4 行，**第 5 行「游戏」要往下拖才看得到**
+ *   · 滚动的实现不在本文件里，在 watch_pages.c 的 on_pressing()：
+ *     页面内容溢出时，纵向拖动改为滚当前页（`lv_obj_scroll_by_bounded`）。
+ *     本页只要"内容真的超出"就会自动获得滚动能力，
+ *     可用串口命令或 `watch_ui_debug_page_scroll()` 确认（应 > 0）。
+ *
+ * ## ⚠️ 副作用：在本页上滑不再打开控制中心
+ *
+ * 一旦页面内容溢出，纵向拖动优先给"滚页面"，手势层的上滑开控制中心
+ * 在本页就失效了（其余 3 页不受影响）。这是滚动方案的必然代价，
+ * 已记入 v0.6.0 版本文档的「已知限制」。
  */
 #include "watch_pages.h"
 #include "watch_style.h"
@@ -36,13 +51,15 @@
 #define LIST_W        (W_SCREEN_W - 2 * W_PAD_PAGE)
 #define LIST_Y        32
 #define LIST_GAP      6
-#define LIST_H        (4 * 52 + 3 * LIST_GAP)   /* = 226，见上面注释 */
+#define ROW_H         52
+#define LIST_H        (5 * ROW_H + 4 * LIST_GAP)   /* = 284，见上面说明 */
 
 /* ==================== 各入口回调 ==================== */
 static void open_settings(lv_event_t *e) { (void)e; watch_settings_open(); }
 static void open_clock(lv_event_t *e)    { (void)e; watch_clock_open(); }
 static void open_wifi(lv_event_t *e)     { (void)e; watch_wifi_open(); }
 static void open_dev(lv_event_t *e)      { (void)e; watch_developer_open_menu(); }
+static void open_games(lv_event_t *e)    { (void)e; watch_games_open(); }
 
 /* ==================== 建界面 ==================== */
 static lv_obj_t *functions_create(lv_obj_t *parent)
@@ -54,9 +71,9 @@ static lv_obj_t *functions_create(lv_obj_t *parent)
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, ROW_TITLE_Y);
 
     /*
-     * 用一个 flex column 容器包住 4 行：
+     * 用一个 flex column 容器包住 5 行：
      * `w_menu_row_create()` 不设 x/y（靠父容器的 flex 排布），
-     * 而轮播页的根是绝对定位的 —— 不包这一层的话 4 行会全叠在 (0,0)。
+     * 而轮播页的根是绝对定位的 —— 不包这一层的话 5 行会全叠在 (0,0)。
      */
     lv_obj_t *list = w_flex_col_create(scr, 0, LIST_Y, LIST_W, LIST_H, LIST_GAP);
 
@@ -64,6 +81,7 @@ static lv_obj_t *functions_create(lv_obj_t *parent)
     w_menu_row_create(list, W_STR_CLOCK,       W_STR_FUNC_CLOCK_SUB, open_clock);
     w_menu_row_create(list, W_STR_WIFI_TITLE,  W_STR_FUNC_WIFI_SUB,  open_wifi);
     w_menu_row_create(list, W_STR_DEV_TITLE,   W_STR_FUNC_DEV_SUB,   open_dev);
+    w_menu_row_create(list, W_STR_GAMES,       W_STR_FUNC_GAMES_SUB, open_games);
 
     return scr;
 }

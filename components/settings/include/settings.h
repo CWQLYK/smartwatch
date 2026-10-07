@@ -50,6 +50,8 @@ typedef enum {
     SETTINGS_ALARM_EN,         ///< 闹钟开关 0/1
     SETTINGS_CD_PRESET_SEC,    ///< 倒计时上次选的时长（秒）
     SETTINGS_CD_RING_SEC,      ///< 倒计时到点后的响铃时长（秒），默认 10
+    /* ---------- v0.6.0 新增：游戏存档 ---------- */
+    SETTINGS_DINO_BEST,        ///< 小恐龙最高分 0-99999
     SETTINGS_COUNT             ///< 哨兵，必须放最后
 } settings_key_t;
 

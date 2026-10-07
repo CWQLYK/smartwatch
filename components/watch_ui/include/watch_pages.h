@@ -232,6 +232,58 @@ void watch_ui_debug_dump(void);
  */
 int watch_ui_debug_page_scroll(void);
 
+/**
+ * @brief 调试用：按拖动路径滚当前页
+ *
+ * @param dy **手指位移语义**（和手指拖动一致）：
+ *           负值 = 手指往上划 = 看下面的内容；正值 = 手指下划 = 回顶部。
+ *           页面已经在顶部时传正值会被边界夹住（纹丝不动，这是对的）。
+ * @return 滚完之后还剩多少可滚距离
+ *
+ * @note v0.6.0 加的。功能列表加到 5 行之后内容超过一屏，
+ *       模拟器自检需要确认"真的能滚、第 5 行真的够得着"。
+ *       这里走的是和手指拖动**同一条**代码路径（scroll_page_by）。
+ */
+int watch_ui_debug_scroll_by(int dy);
+
+/** @brief 调试用：当前页已经滚到哪个位置（0 = 顶部） */
+int watch_ui_debug_page_scroll_y(void);
+
+/**
+ * @brief 调试用：模拟一次触摸的"按下 / 移动 / 抬手"
+ *
+ * @note 走的是**和真手指完全相同**的处理函数（drag_begin / drag_move / drag_end），
+ *       不是另抄一份逻辑 —— 所以自检通过能说明真机行为。
+ *
+ *       为什么需要它：用户实测报过"在功能列表上下滑动，滑动后会误进某一项"
+ *       （触摸到了某一行、滑动之后抬手就进去了）。这个问题只有
+ *       "按下 → 移动 → 抬手"这一整条路径才暴露得出来，
+ *       而模拟器没法真的注入触摸事件（这个环境的 SendInput 不生效）。
+ *
+ *       典型用法（自检）：
+ *           watch_ui_debug_touch_begin(120, 116);   // 按在「时钟」那一行上
+ *           watch_ui_debug_touch_move(120, 176);    // 往下拖 60px（滑列表）
+ *           watch_ui_debug_touch_end();             // 抬手
+ *           // 此时 w_touch_was_drag() 应为 true，
+ *           // 再补一个 LV_EVENT_CLICKED 给那一行，它必须**不**响应
+ */
+void watch_ui_debug_touch_begin(int x, int y);
+
+/** @brief 调试用：触摸移动到 (x, y) */
+void watch_ui_debug_touch_move(int x, int y);
+
+/** @brief 调试用：抬手 */
+void watch_ui_debug_touch_end(void);
+
+/**
+ * @brief 调试用：取三个槽位里各页面的子对象数（-1 = 空槽）
+ *
+ * @note 用来确认"当前页"和"槽位里的页"一致 —— 两者会不一致是因为
+ *       `watch_ui_goto()` 一次只翻一页、而槽位要等吸附动画跑完才重排，
+ *       这时量出来的布局全是错的（v0.6.0 自检在这里栽过一次）。
+ */
+void watch_ui_debug_slot_page_children(int *out, int max);
+
 /* ==================================================================
  * 四、内置页面（定义在 watch_ui_pages 组件里）
  *
@@ -337,6 +389,12 @@ void watch_ui_set_setting_hooks(watch_setting_get_fn get_fn,
 #define W_SETTING_CD_PRESET    "cd_preset"     /* 倒计时时长(秒) */
 #define W_SETTING_CD_RING      "cd_ring"       /* 倒计时响铃时长(秒) */
 
+/* ---------- v0.6.0 新增：游戏存档 ----------
+ *
+ * 由游戏宿主（watch_game.c）读写，游戏本体只提供键名
+ * （见 w_game_t::best_key）。加新游戏就再加一个键名 + app 层一行映射。 */
+#define W_SETTING_DINO_BEST    "dino_best"     /* 小恐龙最高分 */
+
 /** @brief 读设置项（钩子没接时返回 def） */
 int watch_ui_setting_get(const char *key, int def);
 
@@ -363,6 +421,9 @@ int watch_ui_setting_set(const char *key, int value);
 
 /** @brief 打开"设置"子页 */
 void watch_settings_open(void);
+
+/** @brief 打开"游戏"列表子页（功能列表第 5 行进去） */
+void watch_games_open(void);
 
 /** @brief 打开"时钟"子页（内含 4 个标签） */
 void watch_clock_open(void);

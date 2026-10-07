@@ -46,7 +46,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.5.0"
+#define APP_VERSION_STR  "0.6.0"
 
 const char *app_version(void)
 {
@@ -169,6 +169,8 @@ static int brightness_set(int percent)
  * ★ v0.5.0：
  *   - 删除：`wrist_wake` / `height` / `weight`（抬腕亮屏取消、步长改固定值）
  *   - 新增：闹钟与倒计时的 5 项（时钟服务用，见 watch_pages.h 的 W_SETTING_*）
+ * ★ v0.6.0：
+ *   - 新增：`dino_best`（小恐龙最高分，游戏宿主读写）
  */
 static int setting_get(const char *key, int def)
 {
@@ -196,6 +198,10 @@ static int setting_get(const char *key, int def)
     }
     if (strcmp(key, W_SETTING_CD_RING) == 0) {
         return (int)settings_get_or_default(SETTINGS_CD_RING_SEC);
+    }
+    /* ---- v0.6.0 游戏存档 ---- */
+    if (strcmp(key, W_SETTING_DINO_BEST) == 0) {
+        return (int)settings_get_or_default(SETTINGS_DINO_BEST);
     }
     ESP_LOGW(TAG, "未知设置项键名 '%s'，返回默认值 %d", key, def);
     return def;
@@ -225,6 +231,10 @@ static int setting_set(const char *key, int value)
         err = settings_set(SETTINGS_CD_PRESET_SEC, value);
     } else if (strcmp(key, W_SETTING_CD_RING) == 0) {
         err = settings_set(SETTINGS_CD_RING_SEC, value);
+    }
+    /* ---- v0.6.0 游戏存档 ---- */
+    else if (strcmp(key, W_SETTING_DINO_BEST) == 0) {
+        err = settings_set(SETTINGS_DINO_BEST, value);
     } else {
         ESP_LOGW(TAG, "未知设置项键名 '%s'", key);
         return -1;

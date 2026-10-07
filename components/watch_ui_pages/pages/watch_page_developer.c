@@ -318,7 +318,7 @@ static void info_row(lv_obj_t *parent, const char *k, const char *v)
 }
 
 /* 这些由 app 层注入（界面层拿不到 esp_* API）*/
-static char s_info_fw[16]     = "0.5.0";
+static char s_info_fw[16]     = "0.6.0";
 static char s_info_heap[24]   = "--";
 static char s_info_psram[24]  = "--";
 static char s_info_uptime[24] = "--";

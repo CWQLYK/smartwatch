@@ -9,7 +9,7 @@
 #
 # NOTE: CMake does NOT support backslash line continuation, keep the list on one line.
 idf_component_register(
-    SRCS "watch_style.c" "watch_widgets.c" "watch_pages.c" "watch_gesture.c" "watch_overlay.c" "watch_keyboard.c" "watch_platform.c" "watch_modal.c" "watch_wheel.c" "watch_clock.c" "watch_alert.c"
+    SRCS "watch_style.c" "watch_widgets.c" "watch_pages.c" "watch_gesture.c" "watch_overlay.c" "watch_keyboard.c" "watch_platform.c" "watch_modal.c" "watch_wheel.c" "watch_clock.c" "watch_alert.c" "watch_gfx.c" "watch_game.c"
     INCLUDE_DIRS "include"
     REQUIRES lvgl ui_port fonts
 )

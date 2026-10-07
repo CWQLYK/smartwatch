@@ -60,6 +60,7 @@
 #include "watch_modal.h"
 #include "watch_clock.h"
 #include "watch_alert.h"
+#include "watch_game.h"
 
 static const char *TAG = "WATCH_UI";
 
@@ -101,6 +102,7 @@ static lv_coord_t s_off = 0;
 /* 拖动状态 */
 static bool       s_dragging = false;
 static lv_point_t s_drag_start;
+static lv_coord_t s_drag_max = 0;         /* 本次按下过程中出现过的最大位移 */
 static bool       s_committing = false;   /* 正在重排，挡住新手势 */
 
 /*
@@ -435,53 +437,82 @@ static void scroll_page_to_top(void)
     lv_obj_set_scroll_dir(page, LV_DIR_NONE);
 }
 
-static void on_pressed(lv_event_t *e)
+/**
+ * @brief 位移超过多少像素就认为"这次是滑动，不是点击"
+ *
+ * 10px 是 LVGL 自己的默认滚动阈值（`LV_INDEV_DEF_SCROLL_LIMIT`）。
+ * 比它小的抖动算点击（手指按下去本来就会抖），比它大就一定是想滑动。
+ */
+#define DRAG_SUPPRESS_CLICK_PX   10
+
+/** @brief 抬手之后异步清掉"拖动"标记（为什么要异步见 drag_end） */
+static void drag_flag_clear_async(void *user)
+{
+    (void)user;
+    w_touch_clear_drag();
+}
+
+/** @brief 按下：记起点，清掉上一次残留的"拖动"标记 */
+static void drag_begin(const lv_point_t *pt)
 {
     if (s_committing) {
         return;                     /* 正在重排，忽略这次触摸 */
     }
-    lv_indev_t *indev = lv_indev_get_act();
-    if (!indev) {
-        return;
-    }
 
     lv_anim_del(s_vp, anim_off_cb); /* 抓住正在跑的收尾动画 */
-    lv_indev_get_point(indev, &s_drag_start);
-    s_dragging = true;
-    s_page_dy  = 0;
+    s_drag_start = *pt;
+    s_drag_max   = 0;
+    s_dragging   = true;
+    s_page_dy    = 0;
+    w_touch_clear_drag();
 
     /* 这次按下的"页面能不能纵向滚"，只算一次 */
     s_page_scroll_limit = current_page_scroll_range();
 }
 
-static void on_pressing(lv_event_t *e)
+/** @brief 拖动中：主轴锁定 + 滚页面 / 跟手翻页 */
+static void drag_move(const lv_point_t *pt, lv_obj_t *target)
 {
     if (!s_dragging) {
         return;
     }
 
-    /* 滑块等"自己会拖"的控件要放行（比如控制中心的亮度滑块） */
-    lv_obj_t *target = lv_event_get_target(e);
+    /* 滑块等"自己会拖"的控件要放行（比如控制中心的亮度滑块）。
+     * 那种情况 LVGL 自己会把 scroll_obj 设上，点击本来就轮不到我们，
+     * 所以也不用标记。 */
     if (target && lv_obj_get_scroll_dir(target) != LV_DIR_NONE) {
         return;
     }
 
-    lv_indev_t *indev = lv_indev_get_act();
-    if (!indev) {
-        return;
+    const lv_coord_t dx = (lv_coord_t)(pt->x - s_drag_start.x);
+    const lv_coord_t dy = (lv_coord_t)(pt->y - s_drag_start.y);
+
+    /*
+     * ★ 标记"这次触摸是拖动"（用户实测报的误触就靠这个拦）
+     *
+     * 用**过程中出现过的最大位移**，而不是"抬手时相对起点的位移"：
+     *   用户往下拖 60px 滑列表、再往回拖到起点附近才松手的话，
+     *   后者算出来是 0，就会被当成点击 —— 照样误进页面。
+     *
+     * ⚠️ 为什么必须自己记：轮播页的纵向滚动是本文件手写的，
+     *    LVGL 的 scroll_obj 一直是 NULL，它那套"滚动就不发点击"
+     *    对我们不生效（源码贴在 watch_widgets.h 里）。
+     */
+    const lv_coord_t adx = LV_ABS(dx);
+    const lv_coord_t ady = LV_ABS(dy);
+    const lv_coord_t moved = (adx > ady) ? adx : ady;
+    if (moved > s_drag_max) {
+        s_drag_max = moved;
+        if (s_drag_max > DRAG_SUPPRESS_CLICK_PX) {
+            w_touch_mark_drag();
+        }
     }
-
-    lv_point_t cur;
-    lv_indev_get_point(indev, &cur);
-
-    lv_coord_t dx = (lv_coord_t)(cur.x - s_drag_start.x);
-    const lv_coord_t dy = (lv_coord_t)(cur.y - s_drag_start.y);
 
     /*
      * 主轴锁定：谁位移大听谁的。
      *
-     * 纵向分支（这里是修 bug 的地方）：
-     *   页面内容超过一屏时（设置页 450px > 280px），纵向拖动应该**滚页面**。
+     * 纵向分支：
+     *   页面内容超过一屏时（功能列表 316px > 280px），纵向拖动应该**滚页面**。
      *   之前的版本直接 return，把纵向完全丢给手势层（上滑开控制中心），
      *   结果"开发人员选项"被挤到屏外且永远够不着 —— 用户实际遇到的问题。
      *
@@ -490,7 +521,7 @@ static void on_pressing(lv_event_t *e)
      *   （详见 current_page_scroll_range() 的说明）。
      *   所以这里只对"确实溢出"的页面做滚动，其余照旧交给手势层。
      */
-    if (LV_ABS(dx) <= LV_ABS(dy)) {
+    if (adx <= ady) {
         if (s_page_scroll_limit > 0) {
             /* 按"本次拖动增量"滚，避免累加误差 */
             const lv_coord_t step = dy - s_page_dy;
@@ -518,12 +549,23 @@ static void on_pressing(lv_event_t *e)
     apply_offsets(want);
 }
 
-static void on_released(lv_event_t *e)
+/** @brief 抬手：决定换页还是弹回 */
+static void drag_end(void)
 {
     if (!s_dragging) {
         return;
     }
     s_dragging = false;
+
+    /*
+     * ★ "拖动"标记要**异步**清，不能在这里直接清。
+     *
+     * LVGL 的事件顺序是（见 lv_indev.c 的 indev_proc_release）：
+     *     RELEASED（就是这里） → SHORT_CLICKED → CLICKED
+     * 直接清掉的话，紧接着那个 CLICKED 读到的就是"没拖动过"，守卫白加。
+     * 异步回调跑在同一次 lv_timer_handler 的后面，稳在 CLICKED 之后。
+     */
+    lv_async_call(drag_flag_clear_async, NULL);
 
     const lv_coord_t off = s_off;
     const lv_coord_t thresh = COMMIT_THRESHOLD_PX;
@@ -543,6 +585,35 @@ static void on_released(lv_event_t *e)
     s_cur = idx_wrap(s_cur + dir);
     s_committing = true;
     start_snap_anim((lv_coord_t)(-dir) * W_SCREEN_W, true);
+}
+
+static void on_pressed(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) {
+        return;
+    }
+    lv_point_t pt;
+    lv_indev_get_point(indev, &pt);
+    drag_begin(&pt);
+}
+
+static void on_pressing(lv_event_t *e)
+{
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) {
+        return;
+    }
+    lv_point_t pt;
+    lv_indev_get_point(indev, &pt);
+    drag_move(&pt, lv_event_get_target(e));
+}
+
+static void on_released(lv_event_t *e)
+{
+    (void)e;
+    drag_end();
 }
 
 /* ==================== 数据回调 ==================== */
@@ -757,6 +828,16 @@ esp_err_t watch_ui_init(const watch_data_provider_t *provider,
      */
     watch_alert_init(s_scr);
 
+    /*
+     * 游戏宿主（v0.6.0）也挂在 screen 上，同样是 s_vp 的兄弟。
+     *
+     * ⚠️ 顺序：必须排在提醒层**之后**创建 —— 游戏层打开时会 move_foreground
+     *    置顶，而提醒层每次 poll 又把自己置顶，所以闹钟能盖住游戏。
+     *    两层都建好之后，谁在最上面取决于运行期的 move_foreground，跟这里无关；
+     *    但先建提醒层能保证"刚打开游戏、闹钟恰好在这一刻响"时提醒层不被漏掉。
+     */
+    watch_game_init(s_scr);
+
     watch_state_t st;
     s_provider->get_state(&st);
     refresh_current(&st, WATCH_CHANGED_ALL);
@@ -954,6 +1035,94 @@ uint32_t watch_ui_current_epoch(void)
 int watch_ui_debug_page_scroll(void)
 {
     return (int)current_page_scroll_range();
+}
+
+/*
+ * ==================================================================
+ * 自检用：模拟一次触摸（按下 / 移动 / 抬手）
+ *
+ * 为什么需要：用户报的"滑动后误进列表项"这个问题，
+ * 只有"按下 → 移动一段 → 抬手"这一整条路径才暴露得出来，
+ * 而模拟器**没法真的注入触摸**（这个环境的 SendInput 不生效）。
+ *
+ * 所以这里把三个事件处理函数的**函数体**（drag_begin / drag_move / drag_end）
+ * 直接暴露出来 —— 注意不是另抄一份逻辑：
+ * 真正的 lv_event 回调 on_pressed/on_pressing/on_released
+ * 只是"取点 → 调这三个函数"，所以自检走的和真手指是同一条路径。
+ *
+ * ⚠️ 唯一没覆盖的是 LVGL 的**命中测试**（哪个控件收到事件）：
+ *    这里传的 target 固定为 NULL（表示"不是滑块"），
+ *    行控件收不收得到点击由自检自己用 lv_event_send() 补上。
+ * ==================================================================
+ */
+void watch_ui_debug_touch_begin(int x, int y)
+{
+    lv_point_t pt = { (lv_coord_t)x, (lv_coord_t)y };
+    drag_begin(&pt);
+}
+
+void watch_ui_debug_touch_move(int x, int y)
+{
+    lv_point_t pt = { (lv_coord_t)x, (lv_coord_t)y };
+    drag_move(&pt, NULL);
+}
+
+void watch_ui_debug_touch_end(void)
+{
+    drag_end();
+}
+
+/** @brief 自检用：每个槽位里的页各有多少个子对象（0 = 空槽） */
+void watch_ui_debug_slot_page_children(int *out, int max)
+{
+    for (int i = 0; i < SLOT_COUNT && i < max; i++) {
+        out[i] = s_slot[i].page ? (int)lv_obj_get_child_cnt(s_slot[i].page) : -1;
+    }
+}
+
+int watch_ui_debug_scroll_by(int dy)
+{
+    /*
+     * 走**和手指拖动完全同一条路径**（scroll_page_by），不是另抄一份逻辑。
+     * 这样自检通过就说明真机上拖得动 —— 抄一份的话，自检永远通过，
+     * 而真机可能因为标记/边界条件不同滚不动（本项目踩过同类坑）。
+     */
+    if (current_page_scroll_range() <= 0) {
+        return 0;                       /* 内容不满一屏，本来就不该滚 */
+    }
+    scroll_page_by((lv_coord_t)dy);
+
+    /*
+     * 返回**还剩多少可滚距离**（不是总范围）。
+     * ⚠️ 别拿 current_page_scroll_range() 当返回值：它算的是 top+bottom，
+     *    也就是"总范围"，滚到底之后它还是 60 而不是 0 ——
+     *    自检里按"剩 0"断言会一直失败（我第一版就是这么写的）。
+     */
+    lv_obj_t *page = s_slot[1].page;
+    if (!page) {
+        return 0;
+    }
+    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+    const int left = (int)lv_obj_get_scroll_bottom(page);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_NONE);
+    return left;
+}
+
+/** @brief 当前页滚到哪了（0 = 顶部） */
+int watch_ui_debug_page_scroll_y(void)
+{
+    lv_obj_t *page = s_slot[1].page;
+    if (!page) {
+        return 0;
+    }
+    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+    const int y = (int)lv_obj_get_scroll_y(page);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(page, LV_DIR_NONE);
+    return y;
 }
 
 int watch_ui_debug_scroll_x(void)

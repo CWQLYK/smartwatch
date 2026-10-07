@@ -219,6 +219,48 @@ lv_obj_t *w_flex_col_create(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
 lv_obj_t *w_menu_row_create(lv_obj_t *parent, const char *title, const char *sub,
                             lv_event_cb_t cb);
 
+/* ==================================================================
+ * 触摸"拖动 / 点击"判定（v0.6.0 修用户实测问题）
+ *
+ * ## 为什么需要它（用户实测报的）
+ *
+ *     "在列表上下滑动的过程中，滑动后会误触到其中一个选项 ——
+ *      例如我从上往下滑动时手指是触到时钟，滑动后就进入到了时钟页面"
+ *
+ * ## 根因（对着 LVGL 源码看）
+ *
+ * `lv_indev.c` 的 `indev_proc_release()`：
+ *
+ *     lv_event_send(indev_obj_act, LV_EVENT_RELEASED, indev_act);
+ *     if(scroll_obj == NULL) {                 // ← 判据在这里
+ *         lv_event_send(..., LV_EVENT_SHORT_CLICKED, ...);
+ *         lv_event_send(..., LV_EVENT_CLICKED, ...);
+ *     }
+ *
+ * 也就是说：LVGL 判"这次按下有没有变成滚动"（`scroll_obj`），
+ * 是滚动就不发点击。**但轮播页的纵向滚动是本项目手写的**
+ * （watch_pages.c 的 `scroll_page_by`；理由是"页面根一旦可滚动，
+ *  上滑开控制中心就失效了"，见那里的长注释）——
+ * 在 LVGL 眼里 `scroll_obj` 永远是 NULL，于是**滚动照做、CLICKED 照发**。
+ *
+ * ## 做法
+ *
+ * 手势层在位移超过阈值时把这次触摸标记成"拖动"；
+ * `w_menu_row_create()` 建出来的行自带守卫，是拖动就丢掉这次点击。
+ * 标记由手势层在**抬手之后异步清除** —— 不能直接清：
+ * 事件顺序是 `RELEASED → SHORT_CLICKED → CLICKED`，
+ * 直接清掉的话，真正要拦的那个 CLICKED 反而看不到标记了。
+ * ================================================================== */
+
+/** @brief 本次触摸是否已经变成"拖动"（拖动之后的抬手不该当成点击） */
+bool w_touch_was_drag(void);
+
+/** @brief 标记本次触摸已变成拖动（由手势层在位移超阈值时调） */
+void w_touch_mark_drag(void);
+
+/** @brief 清除标记（由手势层在抬手后的异步回调里调） */
+void w_touch_clear_drag(void);
+
 /**
  * @brief 造一个大按钮
  *

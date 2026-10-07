@@ -41,6 +41,8 @@ static const settings_desc_t s_desc[SETTINGS_COUNT] = {
     [SETTINGS_ALARM_EN]       = { "alm_en",   0,      0,     1, "闹钟开关" },
     [SETTINGS_CD_PRESET_SEC]  = { "cd_set", 300,     10, 86399, "倒计时时长(秒)" },
     [SETTINGS_CD_RING_SEC]    = { "cd_ring", 10,      1,   300, "倒计时响铃时长(秒)" },
+    /* ---------- v0.6.0 新增：游戏存档 ---------- */
+    [SETTINGS_DINO_BEST]      = { "dino_best", 0,     0, 99999, "小恐龙最高分" },
 };
 
 /* ==================== 运行期状态 ==================== */

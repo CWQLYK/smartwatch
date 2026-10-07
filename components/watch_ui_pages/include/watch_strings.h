@@ -290,6 +290,31 @@ static inline const char *w_weekday_text(int iso_weekday)
  * 这里只留**页面侧**要用的。 */
 #define W_STR_ALARM_TITLE_PAGE  "闹钟"
 
+/* ==================================================================
+ * v0.6.0 新增：游戏
+ *
+ * 层级：功能列表 → 游戏 → 游戏列表 → 全屏小恐龙
+ * ⚠️ 游戏宿主（watch_ui/watch_game.c）里的"暂停/继续/重新开始/退出/开始/
+ *    返回/已暂停/游戏结束/本局得分/最高分"是**字面量**（原因同"通用按钮"），
+ *    不要为了统一把它们也搬到这里 —— 那一层 include 不到本文件。
+ * ================================================================== */
+
+/** @brief 功能列表第 5 行 + 游戏列表页标题 */
+#define W_STR_GAMES             "游戏"
+#define W_STR_FUNC_GAMES_SUB    "小恐龙，玩一局"
+
+/** @brief 游戏列表：一款游戏一行 */
+#define W_STR_GAME_DINO         "小恐龙"
+#define W_STR_GAME_DINO_HINT    "点屏幕跳跃，按住跳更高"
+#define W_STR_GAME_BEST_FMT     "最高分 %d"
+#define W_STR_GAME_LIST_HINT    "选一个游戏开始。玩的时候点左上角可以暂停或退出。"
+#define W_STR_GAME_NO_MORE      "更多游戏还在做"
+
+/** @brief 开发人员选项里的游戏自检入口（占了"蜂鸣器测试"旁边？没有，见下）
+ *
+ * 这里**故意不加**串口/开发菜单入口：游戏的调试入口在模拟器自检里，
+ * 实机上普通用户能点到的路径就够了，开发人员选项保持现状。 */
+
 #ifdef __cplusplus
 }
 #endif

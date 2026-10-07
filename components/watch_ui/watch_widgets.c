@@ -529,6 +529,52 @@ lv_obj_t *w_flex_col_create(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
     return box;
 }
 
+/* ==================================================================
+ * 触摸"拖动 / 点击"判定
+ *
+ * 完整背景（LVGL 为什么拦不住、为什么不能在这里直接清标记）见 watch_widgets.h。
+ * ================================================================== */
+static bool s_touch_drag = false;
+
+bool w_touch_was_drag(void)
+{
+    return s_touch_drag;
+}
+
+void w_touch_mark_drag(void)
+{
+    s_touch_drag = true;
+}
+
+void w_touch_clear_drag(void)
+{
+    s_touch_drag = false;
+}
+
+/**
+ * @brief 菜单行的点击守卫
+ *
+ * @note 事件 user_data 里存的是**业务回调本身**（函数指针），不是业务参数 ——
+ *       这样"守卫 + 业务回调"只占一次注册，行上不用挂第二个回调。
+ *       函数指针与 void* 互转在 C 标准里是"实现定义"，但 GCC / POSIX 都保证可用，
+ *       全工程只在这一处这么用。
+ */
+static void menu_row_click_cb(lv_event_t *e)
+{
+    if (w_touch_was_drag()) {
+        /*
+         * 这次按下滑动过，抬手不该算点击 ——
+         * 走到这里说明用户是在列表上滑动，只是手指最后停在了这一行上
+         * （用户实测报的："从上往下滑，手指触到时钟，滑动后就进了时钟页"）。
+         */
+        return;
+    }
+    lv_event_cb_t user_cb = (lv_event_cb_t)lv_event_get_user_data(e);
+    if (user_cb) {
+        user_cb(e);
+    }
+}
+
 lv_obj_t *w_menu_row_create(lv_obj_t *parent, const char *title, const char *sub,
                             lv_event_cb_t cb)
 {
@@ -549,9 +595,34 @@ lv_obj_t *w_menu_row_create(lv_obj_t *parent, const char *title, const char *sub
     lv_obj_align(a, LV_ALIGN_RIGHT_MID, 0, 0);
 
     if (cb) {
-        lv_obj_add_event_cb(card, cb, LV_EVENT_CLICKED, NULL);
+        /*
+         * ⚠️ 挂的是**守卫**，业务回调塞在 user_data 里 ——
+         *    直接挂业务回调的话，拖动后的误点击拦不住（用户实测报的问题）。
+         */
+        lv_obj_add_event_cb(card, menu_row_click_cb, LV_EVENT_CLICKED, (void *)cb);
     }
     return card;
+}
+
+/**
+ * @brief 通用按钮的点击守卫
+ *
+ * @note 和菜单行同一个道理：**轮播页上**的按钮如果不管，
+ *       用户在页面上滑动（滚页面）之后抬手停在按钮上，就会误触发。
+ *       模态子页里的按钮其实由 LVGL 自己管着（模态是原生滚动，
+ *       scroll_obj 非空，CLICKED 本来就不会发），
+ *       但这里统一走守卫更省心 —— 守卫只在"这次触摸被标记成拖动"时才拦，
+ *       其余情况完全是透传，没有副作用。
+ */
+static void btn_click_cb(lv_event_t *e)
+{
+    if (w_touch_was_drag()) {
+        return;
+    }
+    lv_event_cb_t user_cb = (lv_event_cb_t)lv_event_get_user_data(e);
+    if (user_cb) {
+        user_cb(e);
+    }
 }
 
 lv_obj_t *w_btn_create(lv_obj_t *parent, const char *text,
@@ -576,7 +647,7 @@ lv_obj_t *w_btn_create(lv_obj_t *parent, const char *text,
     lv_obj_center(l);
 
     if (cb) {
-        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_event_cb(b, btn_click_cb, LV_EVENT_CLICKED, (void *)cb);
     }
     return b;
 }
