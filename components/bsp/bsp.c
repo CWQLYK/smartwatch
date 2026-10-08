@@ -160,12 +160,34 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (pressed && cnt > 0) {
         data->point.x = x;
         data->point.y = y;
-        data->state   = LV_INDEV_STATE_PRESSED;
 
-        /* 上报用户活动（屏幕灭着时它会只亮屏，见 watch_platform.h） */
+        /*
+         * 上报用户活动：灭屏时它会把屏幕点亮（见 watch_platform.h）。
+         * ★ 必须在问"要不要吞掉"**之前**调 —— 它会顺手置上屏蔽标志。
+         */
         w_screen_notify_activity();
+
+        /*
+         * ★ v0.6.1：如果这一次触摸只是"把屏幕从灭叫醒"，就**不报按下**。
+         *
+         *   原来这里无条件报 PRESSED，而 power.c 注释里说的
+         *   "用 lv_indev_enable(false) 吃掉第一下"实际没生效
+         *   （没有任何地方调过 false，而且 LVGL 是在读回调之前看 disabled 的）
+         *   → 用户息屏时点一下，会既亮屏、又误触发手指下面的控件
+         *   （实测场景：在功能列表上直接进了子页面）。
+         *
+         *   坐标照给：LVGL 的 pointer 处理会无条件读 data->point
+         *   （lv_indev.c 的 indev_pointer_proc），给真实值最安全。
+         */
+        if (w_screen_should_swallow_touch()) {
+            data->state = LV_INDEV_STATE_RELEASED;
+        } else {
+            data->state = LV_INDEV_STATE_PRESSED;
+        }
     } else {
-        data->state   = LV_INDEV_STATE_RELEASED;
+        /* 抬手：解除"吞掉"状态，下一次触摸正常生效 */
+        w_touch_settled();
+        data->state = LV_INDEV_STATE_RELEASED;
     }
 }
 

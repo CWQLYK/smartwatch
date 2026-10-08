@@ -327,9 +327,17 @@ static void show_scan_list(void)
         /*
          * SSID 用**静态副本**而不是栈上的 aps[i].ssid：
          * 回调是异步触发的（用户点的时候 aps[] 早就出作用域了）。
+         *
+         * ★ v0.6.1：这里原来是 snprintf(..., "%s", aps[i].ssid)。
+         *   -O2 下 GCC 直接报错：它无法证明 aps[i].ssid 里一定有结束符，
+         *   于是按"字符串可能一直延伸到整个 aps[] 数组末尾"来算，
+         *   警告"最多 419 字节写进 33 字节"（-Werror=format-truncation）。
+         *   改成定长 memcpy + 显式补 0：语义完全一样（SSID 最多 32 字符），
+         *   但边界是编译器能验证的。
          */
         static char ssid_store[WIFI_SSID_STORE][W_WIFI_SSID_MAX];
-        snprintf(ssid_store[i % WIFI_SSID_STORE], W_WIFI_SSID_MAX, "%s", aps[i].ssid);
+        memcpy(ssid_store[i % WIFI_SSID_STORE], aps[i].ssid, W_WIFI_SSID_MAX);
+        ssid_store[i % WIFI_SSID_STORE][W_WIFI_SSID_MAX - 1] = '\0';
 
         lv_obj_set_user_data(row, (void *)(intptr_t)aps[i].secure);
         lv_obj_add_event_cb(row, ap_clicked, LV_EVENT_CLICKED,
@@ -354,6 +362,31 @@ static void show_scan_list(void)
  *     - 记住上一次状态，**状态一变就重建页面**
  *     - CONNECTING 时显示"正在连接 <SSID>"和一个取消按钮
  * ================================================================== */
+/**
+ * @brief 页面被销毁（返回 / 模态重建）时：带走轮询定时器
+ *
+ * ⚠️ 本回调是 v0.6.1 补的，修的是一处 **use-after-free**：
+ *    轮询定时器原先只在 poll_cb 内部两条路径里被删
+ *    （状态变化重建、扫描超时）。如果用户在**扫描进行中**按返回，
+ *    没有任何人删它 → 定时器继续跑，去写已经释放的 ui.status / ui.list
+ *    → 花屏 / 乱跳 / 随机重启；而且定时器自己也永久泄漏。
+ *
+ * @note 这里**只**做"删定时器 + 清指针"，绝不碰 LVGL 对象 ——
+ *       本回调是在对象析构过程中被调用的，那时候不能再增删控件。
+ */
+static void page_delete_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (ui.poll) {
+        lv_timer_del(ui.poll);
+        ui.poll = NULL;
+    }
+    ui.list     = NULL;
+    ui.status   = NULL;
+    ui.scanning = false;
+}
+
 static void poll_cb(lv_timer_t *t)
 {
     (void)t;
@@ -627,9 +660,27 @@ static void wifi_page_build(lv_obj_t *parent, void *user)
 {
     (void)user;
 
-    /* 每次重建都要清掉旧的对象指针，别让它悬空 */
+    /*
+     * ★ 先把"页面销毁时要删轮询定时器"挂上（v0.6.1 修 P0）。
+     *
+     *   原来这里只有 `ui.poll = NULL` —— 那只是清自己的指针，
+     *   定时器本身没人杀。于是"扫描中按返回"会留下一个继续往
+     *   已释放对象里写的定时器，详见 page_delete_cb 的说明。
+     *
+     *   用 remove + add 两步是为了 parent 被复用时不会重复挂同一个回调
+     *   （page_delete_cb 本身是幂等的，重复挂也无害，但没必要）。
+     */
+    lv_obj_remove_event_cb(parent, page_delete_cb);
+    lv_obj_add_event_cb(parent, page_delete_cb, LV_EVENT_DELETE, NULL);
+
+    /* 重建时旧定时器一律先杀掉：它引用的对象马上就要被删掉了 */
+    if (ui.poll) {
+        lv_timer_del(ui.poll);
+        ui.poll = NULL;
+    }
+
+    /* 对象指针的真正维护者是 page_delete_cb 和下面的重建流程，这里清空只是兜底 */
     ui.list   = NULL;
-    ui.poll   = NULL;
     ui.status = NULL;
     ui.scanning = false;
 

@@ -179,6 +179,15 @@ static void canvas_free(void)
 static void panel_clear(void)
 {
     if (s_panel) {
+        /*
+         * ⚠️ 这里保持**同步**删除，别改成 lv_obj_del_async：
+         *    本函数和 w_game_close() 里删 s_root 如果在同一次收尾里
+         *    各排一个"延迟删除"，两个 lv_async_call 的执行顺序并不保证
+         *    （lv_async_call 是各建一个 0ms 一次性定时器）；万一根先删，
+         *    面板那条延迟回调就会去动已释放内存。
+         *    "事件回调里删祖先"这个根因已经在 cb_quit() 里解决
+         *    —— 整个收尾被挪到事件派发之后执行。
+         */
         lv_obj_del(s_panel);         /* 连子对象一起删，回调里的指针不会残留 */
         s_panel = NULL;
     }
@@ -264,10 +273,34 @@ static void cb_restart(lv_event_t *e)
     cb_start(e);
 }
 
+/**
+ * @brief 把"退出游戏"整个收尾挪到事件派发**之后**执行
+ *
+ * v0.6.1 修的 UAF（真问题，不是理论风险）：
+ *   这个回调是暂停面板上【退出】按钮的 CLICKED 处理器，
+ *   而 `w_game_close()` 会把面板（= **这个按钮的祖先**）和游戏根一起删掉。
+ *   LVGL 8.4 的 `_lv_event_mark_deleted()` 只在"被删对象**就是**事件
+ *   target/current_target"时才置 `e->deleted`（lv_event.c:147-155），
+ *   删祖先不置位；可祖先一删，按钮也跟着被 free，而事件循环返回后
+ *   仍要解引用 `e->current_target`（lv_event.c:449/454/469，以及 :472 读
+ *   `->parent`）→ 读已释放内存。
+ *
+ *   修法：不动收尾逻辑（保持同步删，简单可靠），只把**入口**推迟一帧
+ *   —— 那时事件派发早已结束。
+ *
+ * @note 重复点【退出】是安全的：`w_game_close()` 开头有
+ *       `if (s_state == GS_NONE) return;` 兜底。
+ */
+static void cb_quit_deferred(void *unused)
+{
+    (void)unused;
+    w_game_close();
+}
+
 static void cb_quit(lv_event_t *e)
 {
     (void)e;
-    w_game_close();
+    lv_async_call(cb_quit_deferred, NULL);
 }
 
 static void ui_show_pause_panel(void)
@@ -573,6 +606,7 @@ void w_game_close(void)
     canvas_free();
 
     if (s_root) {
+        /* 同步删（原因见 panel_clear() 的说明：同一次收尾里不能排两个延迟删除） */
         lv_obj_del(s_root);
         s_root = NULL;
     }

@@ -44,7 +44,14 @@ CONFIG_LV_INDEV_DEF_READ_PERIOD=10
 CONFIG_LV_MEM_CUSTOM=y
 CONFIG_LV_MEMCPY_MEMSET_STD=y
 CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
-CONFIG_LV_USE_PERF_MONITOR=y
+# ★ v0.6.1：**关掉**屏上的 FPS/CPU 覆盖层。
+#   这个宏为 1 时，LVGL 会在 lv_layer_sys() 右下角画一个半透明小黑框，
+#   显示 "NN FPS / NN% CPU"（源码：components/lvgl/src/core/lv_refr.c:362-376，
+#   位置由 LV_USE_PERF_MONITOR_POS 决定）—— 那是开发用的，不该出现在正式固件里。
+#   ⚠️ 它一直是开着的（v0.6.0 及以前），而模拟器的 lvgl_sim/lv_conf.h 里是 0，
+#      所以"模拟器截图看不到、实机上有" —— 这类两边配置不一致最难发现。
+#   需要测帧率时：把这里改回 y → `.\build.ps1 clean` → 重新编译。
+CONFIG_LV_USE_PERF_MONITOR=n
 
 # LVGL fonts
 CONFIG_LV_FONT_MONTSERRAT_12=y
@@ -77,6 +84,66 @@ CONFIG_LV_BUILD_EXAMPLES=n
 # MUST match LV_ROLLER_INF_PAGES in lvgl_sim/lv_conf.h, otherwise the
 # simulator and the device behave differently.
 CONFIG_LV_ROLLER_INF_PAGES=3
+
+# ==================== 编译器优化（v0.6.1）====================
+# 原来是 "Debug (-Og)" —— 实测 `build/compile_commands.json` 里就是 -Og。
+# 改 -O2 是**零代码改动**能拿到的最实在一笔性能：
+#   LVGL 渲染、motion 的 50Hz 滤波、游戏每帧的像素搬运全都直接受益。
+# 代价：镜像变大（当前 1.59MB / 4MB 分区，余量充足）。
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ==================== 启动速度 / 内存（v0.6.1）====================
+# 跳过启动时对 8MB PSRAM 的全片写读测试（每次冷启都跑一遍）。
+# 代价：不再在启动阶段发现 PSRAM 损坏。
+CONFIG_SPIRAM_MEMTEST=n
+
+# 深睡唤醒时跳过镜像校验。前提：不开 Secure Boot、不用 OTA 切分区（我们都没用）。
+CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
+
+# bootloader 用 -O2（默认 -Os）。代价：bootloader 变大（现 0x5700，余 32%）。
+CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF=y
+
+# 堆策略：≤16KB 的分配一律走内部 RAM；给内部 RAM 保留 32KB 底。
+# （内部 RAM 只有 ~340KB，PSRAM 有 8MB —— 大块去 PSRAM，小块留内部更快。）
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# ==================== FreeRTOS 运行观测（v0.6.1，给串口命令行用）====================
+# app_console 的 taskmem / stats 需要这三项：
+#   USE_TRACE_FACILITY       —— uxTaskGetSystemState / usStackHighWaterMark
+#   GENERATE_RUN_TIME_STATS  —— 各任务 CPU 占用百分比
+#   VTASKLIST_INCLUDE_COREID —— 打印任务钉在哪个核
+# 代价：每 tick 多一次运行时间统计（很小），二进制略大。
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# ==================== 崩溃现场（v0.6.1）====================
+# 有了它，设备崩了之后把板子插上跑 `idf.py coredump-info` 就能拿到
+# **出错任务 + 调用栈 + 寄存器**，而不是只有一句复位日志。
+# 对"实机验证全靠人"的项目，这是最重要的诊断设施之一。
+# 分区见 partitions.csv 末尾追加的 coredump（256KB）。
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# 任务看门狗超时后**直接 panic 复位**（默认只打印不复位）。
+# 配合上面的 coredump：卡死/死锁也能留下现场，而不是挂在那里装死。
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# ==================== WiFi：WPA3-SAE（保持默认开启）====================
+# ⚠️ v0.6.1 期间的排查实验：**负结果，已回退**，所以这里不写任何开关（用默认 = 开）。
+#
+#   为定位"连 CWQLYK 一直 reason=2（认证超时）"，曾把
+#   `CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n`（强制走 WPA2-PSK）烧进去实测 ——
+#   **仍然失败**；而且那时该 AP 已经被改成纯 WPA2（`authmode=3`，信道 6）。
+#
+#   同期反证：连另一台纯 WPA2 的 AP（ZTE-dxbP9F）能一路走完
+#   `auth -> assoc -> run` 并 `wifi:connected`（`security: WPA2-PSK`），
+#   说明**我们的认证/关联/握手通路本身是正常的**。
+#
+#   ⇒ 结论：不是 WPA3/SAE 的问题，**SAE 保持开启**
+#     （关掉只会失去连纯 WPA3 AP 的能力，而它不是病因）。
+#   详见 doc/version/v0.6.1.md 第八节与后续排查记录。
 
 # ==================== Partition table ====================
 CONFIG_PARTITION_TABLE_CUSTOM=y

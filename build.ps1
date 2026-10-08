@@ -55,3 +55,16 @@ switch ($Action) {
         if ($Port) { idf.py -p $Port flash monitor } else { idf.py flash monitor }
     }
 }
+
+# ============================================================
+#  退出码必须反映 idf.py 的真实结果（v0.6.1 修）
+#
+#  原来脚本跑完 switch 就结束，退出码由 PowerShell 自己决定 ——
+#  实测出现过"构建成功但脚本 exit 1"（自动化会误判失败），
+#  反过来也可能吞掉真正的失败。所以这里显式收口。
+# ============================================================
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "=== 失败：idf.py 退出码 $LASTEXITCODE ===" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
+exit 0

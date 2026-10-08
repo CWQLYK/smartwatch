@@ -579,7 +579,18 @@ lv_obj_t *w_menu_row_create(lv_obj_t *parent, const char *title, const char *sub
                             lv_event_cb_t cb)
 {
     lv_obj_t *card = w_card_create_clickable(parent, W_AUTO_POS, W_AUTO_POS,
-                                             LV_PCT(100), 52);
+                                             LV_PCT(100), W_MENU_ROW_H);
+
+    /*
+     * ★ v0.6.1：纵向内边距压到 2px（水平保持 W_PAD_CARD）。
+     *
+     *   卡片默认 pad 是 W_PAD_CARD(10) —— 行高 46 时内容区只剩 26px，
+     *   而"16 号标题 + 14 号副标题"两行字约 38px，会明显叠字。
+     *   压到 2px 后内容区 42px，够放两行（详细计算见 watch_widgets.h
+     *   的 W_MENU_ROW_H 说明）。顺带说一句：改用 46 之前，52px 行的
+     *   内容区也只有 32px，本来就偏挤。
+     */
+    lv_obj_set_style_pad_ver(card, 2, 0);
 
     lv_obj_t *t = w_label_create(card, title, watch_font_cn(16), W_COLOR_TEXT);
     if (sub) {

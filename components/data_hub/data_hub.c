@@ -32,7 +32,15 @@ static const char *TAG = "DATA_HUB";
 /* ==================== 采样周期 ==================== */
 #define HUB_BATTERY_PERIOD_MS   30000   /* 电量 30 秒采一次 */
 #define HUB_TASK_PRIO           5
-#define HUB_TASK_STACK          3072
+/*
+ * 采样任务栈。
+ *
+ * ★ v0.6.1：3072 → 4096。
+ *   原因：所有变更回调（也就是**整条 UI 刷新链**）都是在本任务的
+ *   上下文里同步执行的（见 notify_locked），页面 refresh 一复杂，
+ *   3KB 就偏紧。最终值等实机 `taskmem` 量出高水位再定。
+ */
+#define HUB_TASK_STACK          4096
 #define HUB_NOTIFY_MAX          4       /* 最多 4 个变更回调 */
 
 /* 电量变化超过这些阈值才通知（避免电压抖动导致 UI 一直重画）*/
@@ -59,10 +67,20 @@ static void notify_locked(const device_state_t *st, uint32_t changed)
             cbs[n++] = s_cbs[i];
         }
     }
+    /*
+     * ★ v0.6.1：先做一份**快照**，再把锁放开。
+     *
+     *   原来直接把 `&s_state` 交给回调，而回调是在**锁已释放**的情况下跑的 ——
+     *   采样任务可能正在改同一块内存，UI 就可能读到
+     *   "时间字段更新了、日期还是旧的"这种半更新状态（表盘偶发错值）。
+     *   结构体只有几十字节，拷一份的代价可以忽略。
+     */
+    device_state_t snap = *st;
+
     /* 锁外调用回调（回调里可能会调 data_hub_snapshot，不能持锁） */
     xSemaphoreGive(s_lock);
     for (int i = 0; i < n; i++) {
-        cbs[i](st, changed);
+        cbs[i](&snap, changed);
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
 }
@@ -207,7 +225,7 @@ esp_err_t data_hub_init(void)
 
     memset(&s_state, 0, sizeof(s_state));
     s_state.battery.percent = -1;       /* -1 = 未知 */
-    s_state.steps.available = false;    /* P1 还没接 IMU */
+    s_state.steps.available = false;    /* 起手未知：等 motion 第一次上报（IMU 从 v0.3.0 起已接入） */
 
     s_ready = true;
 
@@ -400,7 +418,7 @@ void data_hub_dump(void)
     } else {
         ESP_LOGW(TAG, "  电量：未知（%d mV，可能没接电池）", st.battery.millivolt);
     }
-    ESP_LOGI(TAG, "  步数：%s", st.steps.available ? "已接入" : "未接入（P1 不含 IMU）");
+    ESP_LOGI(TAG, "  步数：%s", st.steps.available ? "已接入" : "未接入（motion 还没上报）");
     ESP_LOGI(TAG, "  事件总线丢弃计数：%" PRIu32, event_bus_dropped());
     ESP_LOGI(TAG, "----------------------");
 }

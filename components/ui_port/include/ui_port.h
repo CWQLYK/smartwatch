@@ -69,6 +69,38 @@ bool ui_port_lock(uint32_t timeout_ms);
 void ui_port_unlock(void);
 
 /**
+ * @brief 进入 / 退出"极短的跨任务临界区"
+ *
+ * 为什么不复用 ui_port_lock()：
+ *   `ui_port_lock()` 是 **LVGL 锁**，它只该保护"碰 lv_xxx 的代码"，
+ *   而且**可能阻塞**（最长 portMAX_DELAY）。但有些状态是
+ *   "两个任务都在改、又完全不碰 LVGL"的 —— 典型例子是
+ *   `watch_clock.c` 的闹钟/倒计时状态：
+ *     时间回调跑在 **data_hub 采样任务**上（每秒必须喂一次，一次都不能漏），
+ *     而响铃推进跑在 **LVGL 任务**上。
+ *   给这类状态套 LVGL 锁是错的：喂时间那条路径会因为拿不到锁而丢秒，
+ *   极端情况下整分钟被丢 → 闹钟哑掉（见 watch_pages.c 的注释）。
+ *
+ * 所以这里给一对**不阻塞、极短**的临界区：
+ *   - 手表端：portMUX（关本核中断，几个赋值的时间，微秒级）
+ *   - PC 端  ：空操作（模拟器是单线程）
+ *
+ * ⚠️ 硬约束（两边都成立，违反会死锁或崩溃）：
+ *   1. 临界区里**不许**调 LVGL、蜂鸣器、`ESP_LOGx` —— 它们会取别的锁；
+ *   2. **不递归**：同一个任务里不要再套一层（portMUX 不是递归锁）；
+ *   3. 只放"几个赋值/比较"，别放循环、别放函数调用。
+ *
+ * @code
+ *   ui_port_critical_enter();
+ *   const bool on = (s_alert != NONE);
+ *   ui_port_critical_exit();
+ *   if (on) { w_buzzer_stop(); }        // 硬件调用放在临界区外
+ * @endcode
+ */
+void ui_port_critical_enter(void);
+void ui_port_critical_exit(void);
+
+/**
  * @brief 平台主循环（**只有 PC 端需要调用**；手表端是空实现）
  *
  * 手表端 LVGL 在自己的 FreeRTOS 任务里跑，app_main 可以挂起；

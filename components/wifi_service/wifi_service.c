@@ -270,6 +270,34 @@ static void set_state(wifi_state_t st)
 static volatile bool s_conn_used_saved  = false;
 static volatile bool s_user_disconnect  = false;
 
+/* ==================================================================
+ * ★ v0.6.1 追加：凭据"待保存"暂存区
+ *
+ * 原来在 `hook_connect()` 里 — 也就是"配置刚写进驱动"时 — 就 `creds_save()`，
+ * 根本没等到连上。后果：**密码打错也会被存进 NVS**，把原本能用的那个顶掉。
+ * （真机实测踩到过：做排查实验时用错误密码连了一次，NVS 里就变成那个错密码。）
+ *
+ * 现在改成两段式：
+ *   1. `hook_connect()` 只把凭据**暂存**在这里（不落盘）；
+ *   2. 等 `WIFI_EVENT_STA_CONNECTED`（关联 + 4 次握手都过了，说明密码是对的）
+ *      才真正写 NVS；连接失败则在 `DISCONNECTED` 里丢掉这份暂存。
+ *
+ * 注意：这里会**暂时存着一份明文密码**（跟驱动里的 `cfg.sta.password` 一样，
+ *      本来就在 RAM 里）。用完立刻清掉（连上或失败都会清）。
+ * ================================================================== */
+static char s_pend_ssid[WIFI_SSID_MAX];
+static char s_pend_pass[WIFI_PASS_MAX];
+static volatile bool s_pend_save = false;   /* 有暂存的凭据待落盘？ */
+
+/** @brief 丢掉暂存的凭据（连上了会先落盘、失败了会直接丢） */
+static void pend_clear(void)
+{
+    s_pend_save = false;
+    s_pend_ssid[0] = '\0';
+    /* 用 memset 而不是只写 [0]：别把明文密码留在 RAM 里 */
+    memset(s_pend_pass, 0, sizeof(s_pend_pass));
+}
+
 /**
  * @brief 这次失败是不是"认证类"的（值得清掉保存的密码）
  *
@@ -299,6 +327,36 @@ static bool reason_is_auth(int reason)
     }
 }
 
+/**
+ * @brief 此刻调 esp_wifi_disconnect()，会不会真的收到 STA_DISCONNECTED 事件？
+ *
+ * ★ v0.6.1 新增。修的是用户实测"WiFi 一直连不上"的那个坑：
+ *
+ *   `s_user_disconnect` 这个标志是给"我们自己主动断开"用的（用它吞掉
+ *   随之而来的断开事件，免得被当成连接失败）。原来的写法是**无条件置 true**，
+ *   指望"紧接着到达的 DISCONNECTED 会把它消费掉"。
+ *
+ *   但**断开一个空闲的站点根本不会产生任何事件** ——
+ *   日志里那句"等断开事件超时，仍然继续配置"就是这种情况。
+ *   于是标志一直留着，约 4 秒后**真正的认证失败**事件到达时被误判成
+ *   "用户主动断开"：
+ *       · 状态回 IDLE 而不是 FAILED → 界面**不报错**
+ *       · 跳过"清掉坏密码"的分支 → 下次还是拿同一个旧密码去连
+ *   结果：永远连不上、永远不提示、也永远不重新问密码。
+ *
+ *   修法：只在"确实连着或正在连"的时候才认为会有事件；另外 hook_connect
+ *   在等完窗口后**一律清掉**标志（见那里的注释）。
+ *
+ * @note 残留风险（很小）：极少数情况下状态是 CONNECTED/CONNECTING 但驱动
+ *       没发事件，这时标志会漏给下一次失败事件。相比原来的"每次连接都漏"，
+ *       这个量级可以接受。
+ */
+static bool disconnect_event_expected(void)
+{
+    return (s_st.state == W_WIFI_CONNECTED) ||
+           (s_st.state == W_WIFI_CONNECTING);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
@@ -312,6 +370,33 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG, "已关联 AP，等 DHCP");
+            /*
+             * ★ v0.6.1 追加：**到这一步才把凭据写进 NVS**。
+             *
+             * 为什么是这个事件：关联 + 4 次握手都过了 —— 对加密网络来说，
+             * 这就等价于"**密码是对的**"。原来在 `hook_connect()` 里
+             * "配置刚写进驱动"就存，密码打错也会被存下来，把能用的顶掉。
+             *
+             * 开放网络（无密码）也走这里：那时暂存的是"只有 SSID"。
+             */
+            if (s_pend_save) {
+                /* 先清标志再写：万一 nvs 写失败也不要反复重试同一次连接 */
+                const esp_err_t serr = creds_save(s_pend_ssid, s_pend_pass);
+                pend_clear();
+
+                if (serr == ESP_OK) {
+                    ESP_LOGI(TAG, "连接成功 -> 凭据已保存（下次开机自动重连）");
+                    lock();
+                    s_st.auto_reconnect = true;
+                    unlock();
+                } else {
+                    ESP_LOGW(TAG, "连接成功，但凭据保存失败: %s（本次仍可用）",
+                             esp_err_to_name(serr));
+                    lock();
+                    s_st.auto_reconnect = false;
+                    unlock();
+                }
+            }
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
@@ -333,10 +418,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                  *   而实际上这正是他想要的结果。保持 IDLE。
                  */
                 ESP_LOGI(TAG, "（用户主动断开，保持未连接状态）");
+                pend_clear();       /* ★ v0.6.1 追加：用户不想连了，暂存的凭据也别留着 */
                 lock();
                 s_st.state = W_WIFI_IDLE;
                 s_st.rssi  = 0;
                 s_st.ip[0] = '\0';
+                s_st.auto_reconnect = false;
                 unlock();
                 break;
             }
@@ -347,6 +434,23 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             s_st.rssi  = 0;
             s_st.ip[0] = '\0';
             unlock();
+
+            /*
+             * ★ v0.6.1 追加：**连接失败 -> 丢掉这份待保存的凭据，不写 NVS**。
+             *
+             * 这就是本次改动的核心：只有真正连上（STA_CONNECTED）才落盘。
+             * 否则"密码打错一次"就会把 NVS 里原本能用的密码覆盖掉。
+             *
+             * 顺带把 auto_reconnect 置否：既然什么都没存下，
+             * 界面就不该显示"会自动重连"。
+             */
+            if (s_pend_save) {
+                pend_clear();
+                lock();
+                s_st.auto_reconnect = false;
+                unlock();
+                ESP_LOGW(TAG, "连接未成功 -> 本次凭据不写入 NVS");
+            }
 
             /*
              * ★ 用"已保存的密码"连接失败 -> 自动清掉保存的凭据。
@@ -591,6 +695,7 @@ static int hook_connect(const char *ssid, const char *password)
     bool from_saved = false;            /* 密码是不是从 NVS 回填的 */
     if (password && password[0]) {
         strncpy(eff_pass, password, sizeof(eff_pass) - 1);
+        eff_pass[sizeof(eff_pass) - 1] = '\0';   /* ★ v0.6.1：strncpy 不保证补 0 */
     } else {
         /* 只有 SSID 也匹配时才回填，避免把 A 的密码用到 B 上 */
         char saved_ssid[WIFI_SSID_MAX] = { 0 };
@@ -599,6 +704,13 @@ static int hook_connect(const char *ssid, const char *password)
                        saved_pass, sizeof(saved_pass)) == ESP_OK &&
             saved_ssid[0] && strcmp(saved_ssid, ssid) == 0) {
             strncpy(eff_pass, saved_pass, sizeof(eff_pass) - 1);
+            /*
+             * ★ v0.6.1：strncpy 在"源串长度 ≥ n"时**不会**补结束符。
+             *   这里 eff_pass 是零初始化的（今天侥幸没事），但一旦有人
+             *   去掉那个初始化就会变成真 bug；而且 -O2 下 GCC 直接把它
+             *   报成 -Werror=stringop-truncation 编译错误。显式补上最稳。
+             */
+            eff_pass[sizeof(eff_pass) - 1] = '\0';
             from_saved = true;
             ESP_LOGI(TAG, "使用已保存的密码重连 '%s'（%d 位）",
                      ssid, (int)strlen(eff_pass));
@@ -662,6 +774,8 @@ static int hook_connect(const char *ssid, const char *password)
 
     if (eff_pass[0]) {
         strncpy((char *)cfg.sta.password, eff_pass, sizeof(cfg.sta.password) - 1);
+        /* ★ v0.6.1：同上 —— 显式补结束符，别指望 strncpy */
+        cfg.sta.password[sizeof(cfg.sta.password) - 1] = '\0';
     }
 
     /*
@@ -727,8 +841,13 @@ static int hook_connect(const char *ssid, const char *password)
      *   必须打上"主动断开"标志，否则紧接着到达的 STA_DISCONNECTED
      *   会被当成"用保存的密码连接失败"，直接把我们刚要用的凭据清掉 ——
      *   那就会变成"永远在清密码、永远连不上"。
+     *
+     * ★ v0.6.1：但**只有真的连着/正在连**时才可能有事件（见
+     *   disconnect_event_expected 的说明）—— 原来无条件置 true，
+     *   在"空闲时连接"这个最常见场景下标志会残留，把随后的认证失败
+     *   误判成"用户主动断开"，于是既不报错也不清坏密码。
      */
-    s_user_disconnect = true;
+    s_user_disconnect = disconnect_event_expected();
     esp_wifi_disconnect();
     if (s_disc_sem) {
         /* 等断开事件，最多 2 秒。超时也继续 —— 宁可试一次也不要死等 */
@@ -736,6 +855,12 @@ static int hook_connect(const char *ssid, const char *password)
             ESP_LOGW(TAG, "等断开事件超时，仍然继续配置");
         }
     }
+    /*
+     * ★ v0.6.1：等完（不管事件来没来）**一律清掉**。
+     *   否则标志会漏到 4 秒后真正的认证失败事件上 —— 那正是"一直连不上"
+     *   却毫无提示的根因。
+     */
+    s_user_disconnect = false;
 
     esp_err_t cerr = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (cerr != ESP_OK) {
@@ -765,9 +890,9 @@ static int hook_connect(const char *ssid, const char *password)
     }
 
     /*
-     * 存下来，下次开机自动重连。
+     * 凭据：**先暂存，等连上再落盘**（v0.6.1 追加的核心改动）。
      *
-     * ⚠️ 必须存 `eff_pass`（最终生效的那个），不能存入参 `password`。
+     * ⚠️ 必须用 `eff_pass`（最终生效的那个），不能用入参 `password`。
      *    入参可能是空的（用户点已保存的网络重连、或串口省略密码），
      *    存空串会把 NVS 里原本好好的密码**覆盖掉**，
      *    下次开机就再也自动连不上了。
@@ -781,15 +906,27 @@ static int hook_connect(const char *ssid, const char *password)
      *   而实际连接必然认证失败（reason=2），提示"密码错误"，
      *   用户怎么试都救不回来。
      *
-     *   现在的规则：
+     *   所以规则是：
      *     · 有密码            -> 存（正常路径）
      *     · 没密码 + 确认是开放网络 -> 存 SSID（开放网络本来就没密码，
      *                              留着图个开机自动重连）
      *     · 没密码 + 不确定/是加密的 -> **不写**，并清掉可能存在的坏记录
      *       （"不确定"就是没扫描过、判断不了，宁可不记住也别存坏的）
+     *
+     * ★ v0.6.1 追加：**改掉的是"什么时候写"，不是上面这三条规则。**
+     *
+     *   原来在这里（配置刚写进驱动）就 `creds_save()`，于是**密码打错也会被存进
+     *   NVS**，把原来能用的那个顶掉。真机排查时就踩到了：我用错误密码连了一次，
+     *   NVS 里随即变成那个错密码。用户场景更常见——手滑输错一位，好的密码就没了。
+     *
+     *   现在只登记到 `s_pend_*`，等 `WIFI_EVENT_STA_CONNECTED`（关联 + 4 次握手
+     *   都过了 = 密码是对的）才真正落盘；连接失败会在 DISCONNECTED 里丢掉。
      */
+    pend_clear();
     if (eff_pass[0]) {
-        creds_save(ssid, eff_pass);
+        snprintf(s_pend_ssid, sizeof(s_pend_ssid), "%s", ssid);
+        snprintf(s_pend_pass, sizeof(s_pend_pass), "%s", eff_pass);
+        s_pend_save = true;
         lock();
         s_st.auto_reconnect = true;
         unlock();
@@ -805,7 +942,9 @@ static int hook_connect(const char *ssid, const char *password)
         unlock();
 
         if (ap_is_open) {
-            creds_save(ssid, "");
+            snprintf(s_pend_ssid, sizeof(s_pend_ssid), "%s", ssid);
+            s_pend_pass[0] = '\0';      /* 开放网络：只记 SSID */
+            s_pend_save = true;
             lock();
             s_st.auto_reconnect = true;
             unlock();
@@ -849,8 +988,10 @@ static int hook_disconnect(void)
      *   状态变 FAILED（界面显示"连接失败（密码错或信号太差）"），
      *   而且如果这次连接用的是保存的密码，还会触发"自动取消保存"——
      *   可用户点的是"断开连接"，语义是**保留**密码。
+     *
+     * ★ v0.6.1：只有"真的连着/正在连"才会来事件（见 disconnect_event_expected）
      */
-    s_user_disconnect = true;
+    s_user_disconnect = disconnect_event_expected();
     s_conn_used_saved = false;
     esp_wifi_disconnect();
 
@@ -875,10 +1016,14 @@ static int hook_forget(void)
     if (!s_started) {
         return -1;
     }
-    s_user_disconnect = true;       /* 同上：这是用户主动行为，不是失败 */
+    /* 同上：这是用户主动行为，不是失败。
+     * ★ v0.6.1：仍要按"到底有没有事件"来打标志（见 disconnect_event_expected） */
+    s_user_disconnect = disconnect_event_expected();
     s_conn_used_saved = false;
     esp_wifi_disconnect();
     creds_erase();
+    /* ★ v0.6.1 追加：用户明确要求"忘掉这个网" —— 暂存区里那份也不能回头又存进去 */
+    pend_clear();
 
     lock();
     s_st.state          = W_WIFI_IDLE;
@@ -1027,7 +1172,8 @@ esp_err_t wifi_service_reset(void)
     ESP_LOGW(TAG, "重置 WiFi 驱动（deinit + init）…");
 
     if (s_started) {
-        s_user_disconnect = true;       /* 主动重置，不是连接失败 */
+        /* 主动重置，不是连接失败（★ v0.6.1：同样按"有没有事件"来打标志） */
+        s_user_disconnect = disconnect_event_expected();
         s_conn_used_saved = false;
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -1038,6 +1184,7 @@ esp_err_t wifi_service_reset(void)
 
     /* 清掉保存的凭据，避免再自动重连到旧配置 */
     creds_erase();
+    pend_clear();       /* ★ v0.6.1 追加：暂存区一并清掉，别让重置后又被写回去 */
     lock();
     memset(&s_st, 0, sizeof(s_st));
     s_st.state = W_WIFI_IDLE;

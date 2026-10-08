@@ -32,7 +32,7 @@
 
 
 #ifndef WATCH_FIRMWARE_VERSION
-#define WATCH_FIRMWARE_VERSION "0.6.0"
+#define WATCH_FIRMWARE_VERSION "0.6.1"
 #endif
 
 #define ROW_H         40

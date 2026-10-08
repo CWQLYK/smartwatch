@@ -13,6 +13,7 @@
 #include "watch_platform.h"
 #include "watch_alert.h"
 #include "watch_pages.h"    /* watch_ui_setting_get/set + W_SETTING_* 键名 */
+#include "ui_port.h"        /* ui_port_critical_enter/exit：跨任务短临界区（v0.6.1） */
 
 static const char *TAG = "CLOCK";
 
@@ -299,9 +300,21 @@ bool watch_clock_time_ok(void)       { return s_time_ok; }
 
 bool watch_clock_last_time(int *hour, int *minute)
 {
-    if (hour)   *hour   = s_last_hour;
-    if (minute) *minute = s_last_min;
-    return s_time_ok;
+    /*
+     * ★ v0.6.1：这几个变量是**跨任务**的 ——
+     *   `watch_clock_on_time()` 跑在 data_hub 采样任务上（见 watch_pages.c
+     *   里"必须在拿 LVGL 锁之前喂时间"的说明），而这里被 LVGL 任务调用。
+     *   所以读要包在临界区里，读到的一组值才是同一时刻的。
+     */
+    ui_port_critical_enter();
+    const int  h  = s_last_hour;
+    const int  m  = s_last_min;
+    const bool ok = s_time_ok;
+    ui_port_critical_exit();
+
+    if (hour)   *hour   = h;
+    if (minute) *minute = m;
+    return ok;
 }
 
 /* ==================================================================
@@ -309,23 +322,38 @@ bool watch_clock_last_time(int *hour, int *minute)
  * ================================================================== */
 bool watch_clock_alerting(void)
 {
-    return s_alert != W_CLOCK_ALERT_NONE;
+    ui_port_critical_enter();
+    const bool on = (s_alert != W_CLOCK_ALERT_NONE);
+    ui_port_critical_exit();
+    return on;
 }
 
 w_clock_alert_t watch_clock_alert_kind(void)
 {
-    return s_alert;
+    ui_port_critical_enter();
+    const w_clock_alert_t k = s_alert;
+    ui_port_critical_exit();
+    return k;
 }
 
-/** @brief 开始一次提醒 */
+/** @brief 开始一次提醒
+ *
+ *  @note v0.6.1：状态改写包在临界区里（可能和 hub 任务的时间回调并发），
+ *        但**亮屏和日志都放在临界区外** —— 它们会取别的锁。 */
 static void alert_start(w_clock_alert_t kind)
 {
-    if (s_alert != W_CLOCK_ALERT_NONE) {
+    ui_port_critical_enter();
+    const bool started = (s_alert == W_CLOCK_ALERT_NONE);
+    if (started) {
+        s_alert      = kind;
+        s_alert_ms   = 0;
+        s_alert_beep = false;
+    }
+    ui_port_critical_exit();
+
+    if (!started) {
         return;                      /* 已经在提醒了，别叠加 */
     }
-    s_alert      = kind;
-    s_alert_ms   = 0;
-    s_alert_beep = false;
 
     /* 立刻亮屏：很可能屏幕已经息了，否则用户看不到提示 */
     w_screen_wake();
@@ -335,12 +363,21 @@ static void alert_start(w_clock_alert_t kind)
 
 void watch_clock_alert_stop(void)
 {
-    if (s_alert == W_CLOCK_ALERT_NONE) {
-        return;
-    }
-    w_buzzer_stop();
+    /*
+     * ★ v0.6.1：判断和清状态必须在**同一个**临界区里完成。
+     *   原先写成"先判断、再清"，中间那一小段正是 hub 任务
+     *   可能刚设好 s_alert 的窗口 —— 会把一次刚起来的提醒抹掉。
+     */
+    ui_port_critical_enter();
+    const bool had = (s_alert != W_CLOCK_ALERT_NONE);
     s_alert      = W_CLOCK_ALERT_NONE;
     s_alert_beep = false;
+    ui_port_critical_exit();
+
+    if (!had) {
+        return;
+    }
+    w_buzzer_stop();          /* 硬件调用在临界区外 */
     ESP_LOGI(TAG, "提醒已停止");
 }
 
@@ -352,43 +389,61 @@ void watch_clock_alert_stop(void)
  */
 static void alert_pump(uint32_t dt_ms)
 {
-    if (s_alert == W_CLOCK_ALERT_NONE) {
-        return;
-    }
+    bool beep_on  = false;      /* 需要起音 */
+    bool beep_off = false;      /* 需要停声 */
+    bool run      = false;
 
-    s_alert_ms += dt_ms;
+    /*
+     * ★ v0.6.1：这一整段状态推进放在临界区里（s_alert / s_alert_ms /
+     *   s_alert_beep 会被 hub 任务的时间回调并发写），
+     *   但蜂鸣器调用一律挪到临界区外 —— 它走平台钩子，可能在别的锁上等。
+     */
+    ui_port_critical_enter();
+    if (s_alert != W_CLOCK_ALERT_NONE) {
+        run = true;
+        s_alert_ms += dt_ms;
 
-    /* 倒计时：响够"响铃时长"就自动停（闹钟不自动停，等用户点停止） */
-    if (s_alert == W_CLOCK_ALERT_COUNTDOWN &&
-        s_alert_ms >= (uint32_t)s_cd_ring_sec * 1000u) {
-        w_buzzer_stop();
-        s_alert_beep = false;
-        /*
-         * 注意：**只停声音，不清 s_alert**。
-         * 用户要求提示层继续留在屏幕上，等他点【停止】才关
-         * （见 watch_alert.c）。所以这里用 s_alert_beep 表达"响完了"。
-         */
-        return;
-    }
-
-    const uint32_t phase = s_alert_ms % CLOCK_RING_PERIOD_MS;
-    const bool want_beep = (phase < CLOCK_RING_ON_MS);
-
-    if (want_beep != s_alert_beep) {
-        s_alert_beep = want_beep;
-        if (want_beep) {
-            w_buzzer_tone(CLOCK_BEEP_HZ);
+        /* 倒计时：响够"响铃时长"就自动停（闹钟不自动停，等用户点停止） */
+        if (s_alert == W_CLOCK_ALERT_COUNTDOWN &&
+            s_alert_ms >= (uint32_t)s_cd_ring_sec * 1000u) {
+            s_alert_beep = false;
+            beep_off     = true;
+            /*
+             * 注意：**只停声音，不清 s_alert**。
+             * 用户要求提示层继续留在屏幕上，等他点【停止】才关
+             * （见 watch_alert.c）。所以这里用 s_alert_beep 表达"响完了"。
+             */
         } else {
-            w_buzzer_stop();
+            const uint32_t phase = s_alert_ms % CLOCK_RING_PERIOD_MS;
+            const bool want_beep = (phase < CLOCK_RING_ON_MS);
+            if (want_beep != s_alert_beep) {
+                s_alert_beep = want_beep;
+                beep_on      = want_beep;
+                beep_off     = !want_beep;
+            }
         }
+    }
+    ui_port_critical_exit();
+
+    if (!run) {
+        return;
+    }
+    if (beep_on) {
+        w_buzzer_tone(CLOCK_BEEP_HZ);
+    }
+    if (beep_off) {
+        w_buzzer_stop();
     }
 }
 
 /** @brief 提醒用的响铃是否已经响完（倒计时会自动停；闹钟不会） */
 bool watch_clock_alert_ring_done(void)
 {
-    return (s_alert == W_CLOCK_ALERT_COUNTDOWN) &&
-           (s_alert_ms >= (uint32_t)s_cd_ring_sec * 1000u);
+    ui_port_critical_enter();
+    const bool done = (s_alert == W_CLOCK_ALERT_COUNTDOWN) &&
+                      (s_alert_ms >= (uint32_t)s_cd_ring_sec * 1000u);
+    ui_port_critical_exit();
+    return done;
 }
 
 /* ==================================================================
@@ -399,35 +454,44 @@ void watch_clock_on_time(const watch_time_t *t)
     if (!t) {
         return;
     }
-    s_time_ok = t->valid;
+
+    bool fire = false;
+
+    /*
+     * ★ v0.6.1：整段判定放进临界区。
+     *
+     *   本函数跑在 **data_hub 采样任务**上（watch_pages.c 刻意把它放在
+     *   拿 LVGL 锁之前 —— 闹钟按"时:分"比较，每秒必须喂一次、一次都不能漏），
+     *   而 s_alert / s_alert_ms / s_alert_beep 这一组同时被 LVGL 任务的
+     *   alert_pump() / watch_clock_alert_stop() 改。
+     *
+     *   临界区里只做赋值和比较：日志、亮屏、蜂鸣器全部在外面。
+     *   另外 `alert_start()` 自己也要进临界区，而 portMUX **不是递归锁**，
+     *   所以这里只记下"要触发"，出了临界区再调它。
+     */
+    ui_port_critical_enter();
+    s_time_ok   = t->valid;
     s_last_hour = t->hour;
     s_last_min  = t->minute;
 
-    if (!t->valid) {
-        return;                     /* 没校时：闹钟不生效（界面会提示） */
-    }
-    if (!s_al_en) {
-        return;
-    }
+    if (t->valid && s_al_en) {          /* 没校时：闹钟不生效（界面会提示） */
+        const int hhmm = t->hour * 60 + t->minute;
 
-    const int hhmm = t->hour * 60 + t->minute;
-
-    /* 已经过了闹钟那一分钟 -> 重新武装，这样"每天重复"就成立了 */
-    if (hhmm != s_al_hour * 60 + s_al_min) {
-        if (s_al_fired_hhmm != -1) {
+        /* 已经过了闹钟那一分钟 -> 重新武装，这样"每天重复"就成立了 */
+        if (hhmm != s_al_hour * 60 + s_al_min) {
             s_al_fired_hhmm = -1;
+        } else if (s_al_fired_hhmm != hhmm) {
+            /* 正好落在闹钟那一分钟，且这一分钟还没响过 */
+            s_al_fired_hhmm = hhmm;
+            fire            = true;
         }
-        return;
     }
+    ui_port_critical_exit();
 
-    /* 正好落在闹钟那一分钟 */
-    if (s_al_fired_hhmm == hhmm) {
-        return;                     /* 这一分钟已经响过了 */
+    if (fire) {
+        ESP_LOGI(TAG, "闹钟触发 %02d:%02d", t->hour, t->minute);
+        alert_start(W_CLOCK_ALERT_ALARM);
     }
-    s_al_fired_hhmm = hhmm;
-
-    ESP_LOGI(TAG, "闹钟触发 %02d:%02d", t->hour, t->minute);
-    alert_start(W_CLOCK_ALERT_ALARM);
 }
 
 /* ==================================================================

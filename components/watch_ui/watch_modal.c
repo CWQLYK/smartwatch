@@ -96,7 +96,23 @@ static void destroy_top(void)
     s_depth--;
     modal_t *m = &s_stack[s_depth];
     if (m->root) {
-        lv_obj_del(m->root);
+        /*
+         * ★ v0.6.1：先隐藏，再**异步**删除。
+         *
+         *   为什么不能同步删：本函数经常是在"模态里某个按钮的 CLICKED 回调"
+         *   里被调用的（返回键、滚轮弹窗的确定/取消…），而 `m->root` 正是
+         *   那个按钮的**祖先**。LVGL 8.4 的 `_lv_event_mark_deleted()`
+         *   只在"被删对象**就是**事件 target/current_target"时置
+         *   `e->deleted`（lv_event.c:147-155），**删祖先不置位**；
+         *   可祖先一删，子对象也跟着被 free，而事件循环返回后仍会解引用
+         *   `e->current_target`（lv_event.c:449/454/469/472 里读 `->parent`）
+         *   → 读已释放内存。改成异步删除，事件派发早已结束。
+         *
+         *   先隐藏是为了**不闪**：异步删除要等下一次 lv_timer_handler 才执行，
+         *   中间那一帧若不隐藏，用户会看到旧页面还挂在那里。
+         */
+        lv_obj_add_flag(m->root, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_del_async(m->root);
         m->root = NULL;
     }
     memset(m, 0, sizeof(*m));

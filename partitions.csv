@@ -4,3 +4,9 @@ nvs,       data, nvs,     0x9000,   0x6000,
 phy_init,  data, phy,     0xf000,   0x1000,
 factory,   app,  factory, 0x10000,  4M,
 storage,   data, spiffs,  ,         11M,
+# ★ v0.6.1：崩溃现场。**追加在 flash 尾部**，故意不动上面任何一行 ——
+#   storage 从 0x410000 起算 11M，正好排到 0xF10000，尾部还剩 960KB。
+#   这样加分区**不会移动** nvs / phy_init / factory / storage 的偏移，
+#   所以普通 `idf.py flash` 即可，不需要整片擦除（设置与 IMU 日志都留着）。
+#   已用 `idf.py partition-table` 核实过各分区偏移。
+coredump,  data, coredump, 0xF10000, 0x40000,

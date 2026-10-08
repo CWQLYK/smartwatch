@@ -263,8 +263,34 @@ void w_screen_hold_awake(bool hold);
  *
  * @note 每次检测到触摸按下都要调一次。屏幕灭着时它会**只亮屏**；
  *       亮着时它刷新息屏计时。实现见 power.c 的 hook_activity()。
+ *
+ * @note ★ v0.6.1：如果这次调用**把屏幕从灭叫醒**了，内部会置一个
+ *       "吞掉本次触摸"的标志（见下面两个函数）。
  */
 void w_screen_notify_activity(void);
+
+/**
+ * @brief 这一次触摸是不是"只是用来把屏幕叫醒"的（v0.6.1 新增）
+ *
+ * @note 用法（见 bsp.c 的触摸读取回调）：
+ *         按下时先调 w_screen_notify_activity()，再问这个函数；
+ *         返回 true 就把这一帧上报成 **RELEASED**，不要把坐标和按下状态交给 LVGL。
+ *
+ *   为什么需要它：`power.c` 的注释一直写着"息屏后第一下靠
+ *   `lv_indev_enable(false)` 吃掉"，但**全工程没有任何地方调过 false**；
+ *   而且 LVGL 8.4 是在**调用读回调之前**检查 disabled 的
+ *   （`lv_indev.c:78`），事后禁用根本来不及。
+ *   实测后果：息屏状态下点一下屏幕，会既亮屏、又误触发手指下面的控件
+ *   （例如在功能列表上直接进子页面）。
+ *
+ *   状态放在平台层而不是 bsp.c，是为了让**模拟器也能写自检**（bsp 只有手表端编译）。
+ */
+bool w_screen_should_swallow_touch(void);
+
+/**
+ * @brief 手指抬起：解除"吞掉"状态，下一次触摸正常生效
+ */
+void w_touch_settled(void);
 
 #ifdef __cplusplus
 }

@@ -149,27 +149,41 @@ esp_err_t settings_set(settings_key_t key, int32_t value)
 
     const int32_t v = clamp_value(key, value);
 
+    /*
+     * ★ v0.6.1：缓存更新 + NVS 写入放进**同一把锁**。
+     *
+     *   原来只锁了缓存那几行，`nvs_set_i32` / `nvs_commit` 在锁外 ——
+     *   而 `s_nvs` 是全局句柄，UI（拖亮度）、串口控制台、wifi_service
+     *   （写对时状态）都会并发进来，属于"同一个 NVS 句柄被多任务并发写"。
+     *
+     *   ⚠️ 日志、事件发布一律留在锁外：event_bus_publish 会回调订阅者，
+     *      订阅者可能反过来调 settings_get，持锁发布就是死锁。
+     */
+    bool      changed = false;
+    esp_err_t err     = ESP_OK;
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    const bool changed = (s_cache[key] != v);
+    changed = (s_cache[key] != v);
     if (changed) {
         s_cache[key] = v;
+        err = nvs_set_i32(s_nvs, s_desc[key].nvs_key, v);
+        if (err == ESP_OK) {
+            err = nvs_commit(s_nvs);
+        }
+        if (err == ESP_OK) {
+            s_stored[key] = true;
+        }
     }
     xSemaphoreGive(s_lock);
 
     if (!changed) {
         return ESP_OK;      /* 值没变：不写 flash、不发事件，省擦写寿命 */
     }
-
-    esp_err_t err = nvs_set_i32(s_nvs, s_desc[key].nvs_key, v);
-    if (err == ESP_OK) {
-        err = nvs_commit(s_nvs);
-    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "写入 '%s' 失败: %s", s_desc[key].nvs_key, esp_err_to_name(err));
         return err;
     }
 
-    s_stored[key] = true;
     ESP_LOGI(TAG, "设置变更：%s = %" PRId32 " (%s)", s_desc[key].nvs_key, v,
              s_desc[key].desc);
 
@@ -204,10 +218,14 @@ esp_err_t settings_reset(settings_key_t key)
     }
     ESP_RETURN_ON_ERROR(settings_set(key, s_desc[key].def), TAG, "重置失败");
 
-    /* 恢复默认 = 语义上"这项没被用户改过"，所以把 NVS 键也删掉 */
+    /* 恢复默认 = 语义上"这项没被用户改过"，所以把 NVS 键也删掉。
+     * ★ v0.6.1：和 settings_set 共用同一把锁（并发写同一个 NVS 句柄会出错）。
+     *   注意 settings_set() 已经自己拿过锁了，所以这里必须在它**之后**再拿。 */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     nvs_erase_key(s_nvs, s_desc[key].nvs_key);
     nvs_commit(s_nvs);
     s_stored[key] = false;
+    xSemaphoreGive(s_lock);
 
     ESP_LOGI(TAG, "已恢复默认：%s = %" PRId32, s_desc[key].desc, s_desc[key].def);
     return ESP_OK;
@@ -217,18 +235,22 @@ esp_err_t settings_reset_all(void)
 {
     ESP_LOGI(TAG, "恢复出厂设置：擦除命名空间 '%s'", SETTINGS_NVS_NAMESPACE);
 
+    /* ★ v0.6.1：擦除 + 提交 + 清缓存全部在同一把锁里（并发写同一个 NVS 句柄会出错） */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
     esp_err_t err = nvs_erase_all(s_nvs);
     if (err == ESP_OK) {
         err = nvs_commit(s_nvs);
     }
-    ESP_RETURN_ON_ERROR(err, TAG, "擦除 NVS 失败");
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (int i = 0; i < SETTINGS_COUNT; i++) {
-        s_cache[i]  = s_desc[i].def;
-        s_stored[i] = false;
+    if (err == ESP_OK) {
+        for (int i = 0; i < SETTINGS_COUNT; i++) {
+            s_cache[i]  = s_desc[i].def;
+            s_stored[i] = false;
+        }
     }
     xSemaphoreGive(s_lock);
+
+    ESP_RETURN_ON_ERROR(err, TAG, "擦除 NVS 失败");
 
     event_t e = { .type = EVT_SETTINGS_CHANGED };
     e.data.settings.changed_mask = EVT_MASK_ALL & ((1UL << SETTINGS_COUNT) - 1);

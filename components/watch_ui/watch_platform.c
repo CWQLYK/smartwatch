@@ -100,11 +100,44 @@ void w_screen_hold_awake(bool hold)
     }
 }
 
+/*
+ * ★ v0.6.1："吞掉唤醒那一下触摸"的状态。
+ *
+ *   放在平台层（而不是 bsp.c）的原因：bsp.c 只有手表端编译，
+ *   放这里模拟器也能跑同一段逻辑、也能写自检。
+ *   状态只有一个 bool，读写都在 LVGL 任务的触摸读回调里，不需要加锁。
+ */
+static bool s_swallow_touch = false;
+
 void w_screen_notify_activity(void)
 {
+    /*
+     * ★ 顺序很重要：**先问"屏幕现在是不是灭的"**。
+     *   灭着的话，这一次活动就是"把屏幕叫醒"的那一下，
+     *   它不该再被交给界面（否则会误触发手指下面的控件）。
+     *
+     *   注意 notify_activity() 执行完屏幕就亮了，
+     *   所以必须在调用它**之前**取 was_on。
+     */
+    const bool was_on = w_screen_is_on();
+
     if (s_screen && s_screen->notify_activity) {
         s_screen->notify_activity();
     }
+
+    if (!was_on) {
+        s_swallow_touch = true;      /* 按下~抬手这一整次触摸都吞掉 */
+    }
+}
+
+bool w_screen_should_swallow_touch(void)
+{
+    return s_swallow_touch;
+}
+
+void w_touch_settled(void)
+{
+    s_swallow_touch = false;         /* 抬手：解除屏蔽，下一次触摸正常 */
 }
 
 void w_buzzer_tone(uint32_t freq_hz)

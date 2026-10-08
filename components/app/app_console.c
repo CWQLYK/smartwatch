@@ -1,11 +1,11 @@
 /**
  * @file app_console.c
- * @brief 串口命令行实现（esp_console + linenoise，UART0 115200）
+ * @brief 串口命令行实现（esp_console + linenoise）
  *
  * 实现说明：
- *   - 用 `esp_console_new_repl_uart()` 一把梭：它会装 UART 驱动、
- *     把 stdin/stdout 接到驱动、起一个 REPL 任务，然后立刻返回。
- *     所以**不会阻塞 app_start()**。
+ *   - 走 **USB-Serial-JTAG**（`esp_console_new_repl_usb_serial_jtag`），
+ *     不是 UART0 —— 这块板的 Type-C 直接接 ESP32-S3 原生 USB，
+ *     UART0 只引到扩展口。详见 app_console_start() 里的说明。
  *   - 命令解析用 sscanf 手工做，比 argtable 直观，
  *     而且时间格式（YYYY-MM-DD HH:MM:SS）用 sscanf 一行就能拆。
  *   - 所有命令都在 REPL 自己的任务里跑，**不要在里面碰 lv_xxx**。
@@ -15,10 +15,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_debug_helpers.h"    /* esp_backtrace_print_all_tasks：bt 命令（v0.6.1） */
 #include "bsp.h"
 #include "settings.h"
 #include "data_hub.h"
@@ -803,6 +806,213 @@ static int cmd_time_set(int argc, char **argv)
 /* ==================================================================
  * 注册与启动
  * ================================================================== */
+/* ==================================================================
+ * 命令：taskmem / stats / bt —— 运行时观测（v0.6.1 新增）
+ *
+ * 为什么加这三个（对标 Watch-Player_IDF 的串口控制台）：
+ *   `taskmem` 是**最值钱**的一个 —— 它把每个任务的**栈峰值余量**打出来，
+ *   于是"这个任务的栈该给多大"不再靠猜和试（本工程 data_hub 的采样任务
+ *   上还跑着整条 UI 刷新链，V0.6.1 就是把它的栈从 3072 提到 4096 的，
+ *   最终值应当由这里的实测数据决定）。
+ *
+ *   依赖 sdkconfig 的三项（见 sdkconfig.defaults 里的说明）：
+ *     CONFIG_FREERTOS_USE_TRACE_FACILITY / GENERATE_RUN_TIME_STATS /
+ *     VTASKLIST_INCLUDE_COREID
+ * ================================================================== */
+
+/** @brief 任务状态的中文名 */
+static const char *task_state_str(eTaskState st)
+{
+    switch (st) {
+    case eRunning:   return "运行";
+    case eReady:     return "就绪";
+    case eBlocked:   return "阻塞";
+    case eSuspended: return "挂起";
+    case eDeleted:   return "删";
+    default:         return "?";
+    }
+}
+
+/**
+ * @brief taskmem [任务名] —— 各任务的栈余量
+ *
+ * @note 栈余量用 `uxTaskGetStackHighWaterMark()` 取，**单位是字节**
+ *       （ESP-IDF 的文档明确：FreeRTOS 原生是字，IDF 改成了字节）。
+ *       `TaskStatus_t.usStackHighWaterMark` 字段的单位没有明确说明，
+ *       所以这里显式调 API，避免误读。
+ */
+static int cmd_taskmem(int argc, char **argv)
+{
+    const char *want = (argc > 1) ? argv[1] : NULL;
+
+    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 2;
+    TaskStatus_t *arr = malloc(cap * sizeof(TaskStatus_t));
+    if (!arr) {
+        printf("内存不足\n");
+        return 1;
+    }
+
+    uint32_t total = 0;
+    const UBaseType_t n = uxTaskGetSystemState(arr, cap, &total);
+
+    printf("任务              状态  优先 核    栈余量(字节)\n");
+    printf("------------------------------------------------\n");
+    int shown = 0;
+    for (UBaseType_t i = 0; i < n; i++) {
+        if (want && strcmp(arr[i].pcTaskName, want) != 0) {
+            continue;
+        }
+        const uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(
+                                (TaskHandle_t)arr[i].xHandle);
+        /* 缓冲给足 12 字节：xCoreID 是 int，-O2 下 GCC 会按"最多 11 位数字"算，
+         * 给 5 字节会被判成 -Werror=format-truncation（真踩过） */
+        char core[12];
+        if (arr[i].xCoreID == tskNO_AFFINITY) {
+            snprintf(core, sizeof(core), "any");
+        } else {
+            snprintf(core, sizeof(core), "%d", (int)arr[i].xCoreID);
+        }
+        printf("%-16s  %-4s  %-4u %-4s  %u\n",
+               arr[i].pcTaskName,
+               task_state_str(arr[i].eCurrentState),
+               (unsigned)arr[i].uxCurrentPriority,
+               core, (unsigned)hw);
+        shown++;
+    }
+    free(arr);
+
+    if (want && shown == 0) {
+        printf("没有叫 '%s' 的任务（不带参数看全部）\n", want);
+        return 1;
+    }
+    printf("\n说明：栈余量是【历史最小值】，越小越危险；低于 512 字节就该给它加栈了。\n");
+    return 0;
+}
+
+/** @brief 在两次采样之间按句柄配对（任务顺序可能变） */
+static const TaskStatus_t *find_task(const TaskStatus_t *arr, UBaseType_t n,
+                                     TaskHandle_t h)
+{
+    for (UBaseType_t i = 0; i < n; i++) {
+        if (arr[i].xHandle == h) {
+            return &arr[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief stats —— 各任务 CPU 占用（间隔 1 秒采两次算增量）
+ *
+ * @note 归一化方式：**按核**把该核上所有任务的运行时间增量加起来当分母，
+ *       这样"当前正在跑的任务"不会算出 >100%（踩过这个坑的写法见参考工程）。
+ *       代价：没有亲和性的任务（xCoreID = tskNO_AFFINITY）统一算进核 0，
+ *       所以核 0 的总和会偏高一点 —— 看**相对大小**就好。
+ */
+static int cmd_stats(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 2;
+    TaskStatus_t *a = malloc(cap * sizeof(TaskStatus_t));
+    TaskStatus_t *b = malloc(cap * sizeof(TaskStatus_t));
+    if (!a || !b) {
+        free(a);
+        free(b);
+        printf("内存不足\n");
+        return 1;
+    }
+
+    uint32_t t1 = 0, t2 = 0;
+    const UBaseType_t n1 = uxTaskGetSystemState(a, cap, &t1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    const UBaseType_t n2 = uxTaskGetSystemState(b, cap, &t2);
+
+    uint64_t core_sum[2] = { 0, 0 };
+    for (UBaseType_t i = 0; i < n2; i++) {
+        const TaskStatus_t *p = find_task(a, n1, b[i].xHandle);
+        if (!p) {
+            continue;
+        }
+        const uint32_t d = b[i].ulRunTimeCounter - p->ulRunTimeCounter;
+        const int c = (b[i].xCoreID == tskNO_AFFINITY) ? 0 : (int)b[i].xCoreID;
+        if (c >= 0 && c < 2) {
+            core_sum[c] += d;
+        }
+    }
+
+    printf("任务              CPU%%   优先 核\n");
+    printf("-----------------------------------\n");
+    for (UBaseType_t i = 0; i < n2; i++) {
+        const TaskStatus_t *p = find_task(a, n1, b[i].xHandle);
+        if (!p) {
+            continue;                       /* 这 1 秒内新建的任务，跳过 */
+        }
+        const uint32_t d = b[i].ulRunTimeCounter - p->ulRunTimeCounter;
+        const int c = (b[i].xCoreID == tskNO_AFFINITY) ? 0 : (int)b[i].xCoreID;
+        const int cpu = (c >= 0 && c < 2 && core_sum[c])
+                            ? (int)((uint64_t)d * 100 / core_sum[c]) : 0;
+        printf("%-16s  %4d%%  %-4u %s\n", b[i].pcTaskName, cpu,
+               (unsigned)b[i].uxCurrentPriority,
+               (b[i].xCoreID == tskNO_AFFINITY) ? "any" : "");
+    }
+    free(a);
+    free(b);
+
+    printf("\n总运行时间计数 %u -> %u（单位 us；无亲和性的任务算进核 0）\n",
+           (unsigned)t1, (unsigned)t2);
+    return 0;
+}
+
+/**
+ * @brief bt —— 打印所有任务的调用栈
+ *
+ * @note 用途：设备卡死/看门狗复位之后，先看这里"卡在哪个函数"。
+ *       它内部会短暂挂起调度器取快照，属于**诊断**手段，别在正常运行时频繁调。
+ *       （只支持"全部任务"，不支持按名字过滤：单个任务的栈回溯要自己走 TCB 取帧，
+ *        收益不大、风险不小，暂不做。）
+ */
+static int cmd_bt(int argc, char **argv)
+{
+    (void)argv;
+    if (argc > 1) {
+        printf("本命令不支持指定任务名（直接敲 bt 会打印所有任务）\n");
+        return 1;
+    }
+    printf("=== 所有任务的调用栈（depth=50）===\n");
+    const esp_err_t err = esp_backtrace_print_all_tasks(50);
+    if (err != ESP_OK) {
+        printf("打印失败: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief crash —— **故意崩溃**，用来验证 coredump 通路
+ *
+ * @warning 会让设备立刻复位。只在验证 coredump 时用。
+ *
+ * 用法（v0.6.1 加的，为的是"以后崩了能查到现场"这件事本身可验证）：
+ *   1. 串口敲 `crash`
+ *   2. 设备打印回溯后复位
+ *   3. 在 PC 工程目录跑 `idf.py coredump-info`
+ *      → 应当能看到出错任务和调用栈
+ */
+static int cmd_crash(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    printf("即将故意触发一次 panic（用于验证 coredump），设备会复位...\n");
+    printf("复位后在 PC 上跑: idf.py coredump-info\n");
+    fflush(stdout);
+
+    esp_system_abort("crash 命令：故意触发的崩溃，用于验证 coredump 通路");
+    return 0;   /* 不会走到这里 */
+}
+
 static void register_commands(void)
 {
     static const esp_console_cmd_t cmds[] = {
@@ -822,6 +1032,12 @@ static void register_commands(void)
         { .command = "settings",       .help = "打印所有设置项", .func = cmd_settings },
         { .command = "reset_settings", .help = "恢复出厂设置", .func = cmd_reset_settings },
         { .command = "status",         .help = "硬件自检 + 状态快照", .func = cmd_status },
+        /* v0.6.1 新增：运行时观测（taskmem 用来定各任务的栈大小） */
+        { .command = "taskmem",        .help = "任务栈余量: taskmem [任务名]", .func = cmd_taskmem },
+        { .command = "stats",          .help = "各任务 CPU 占用（采两次，间隔 1 秒）", .func = cmd_stats },
+        { .command = "bt",             .help = "打印所有任务的调用栈（卡死时用）", .func = cmd_bt },
+        /* ⚠️ 会让你重启，仅调试用 */
+        { .command = "crash",          .help = "故意崩溃（验证 coredump 用，会复位）", .func = cmd_crash },
     };
 
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {

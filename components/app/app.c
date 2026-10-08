@@ -46,7 +46,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.6.0"
+#define APP_VERSION_STR  "0.6.1"
 
 const char *app_version(void)
 {
@@ -468,6 +468,77 @@ static void on_sntp_synced(uint32_t utc_epoch)
 /* ==================================================================
  * 四、启动流程
  * ================================================================== */
+/* ==================================================================
+ * 背光淡入（v0.6.1）
+ *
+ * 为什么加：原来开机是"直接设到目标亮度" —— 黑屏里突然亮起来有点刺眼，
+ * 而且如果 LVGL 首帧还没画完，那一下会把花屏/半成品界面暴露出来。
+ *
+ * 做法（对标参考工程的 boot_anim）：
+ *   1. 启动早期把背光保持在 0（屏幕黑着，用户看不到半成品界面）；
+ *   2. **界面初始化完成之后**才开始 0 → 目标亮度 的淡入（约 300ms）。
+ *
+ * 取舍：不做"触摸打断淡入" —— 全程只有 300ms，为它再加一套状态不值当。
+ *       淡入期间如果用户改亮度，会被淡入的最后一步覆盖回旧值（下次改就好）。
+ * ================================================================== */
+static esp_timer_handle_t s_fade_timer  = NULL;
+static int                s_fade_target = 0;
+static int                s_fade_cur    = 0;
+
+#define BL_FADE_STEP_MS   30      /* 每步时长 */
+#define BL_FADE_STEPS     10      /* 步数 → 总时长约 300ms */
+#define BL_MIN_VISIBLE    5       /* 低于这个值基本看不见，直接给 5 */
+
+static void bl_fade_cb(void *arg)
+{
+    (void)arg;
+
+    const int step = (s_fade_target / BL_FADE_STEPS > 0)
+                         ? (s_fade_target / BL_FADE_STEPS) : 1;
+    s_fade_cur += step;
+
+    if (s_fade_cur >= s_fade_target) {
+        bsp_backlight_set(s_fade_target);
+        if (s_fade_timer) {
+            esp_timer_stop(s_fade_timer);
+        }
+        s_fade_cur = s_fade_target;
+        ESP_LOGI(TAG, "背光淡入完成（%d%%）", s_fade_target);
+        return;
+    }
+    bsp_backlight_set((s_fade_cur > BL_MIN_VISIBLE) ? s_fade_cur : BL_MIN_VISIBLE);
+}
+
+/** @brief 开始淡入（0 → target）。target<=0 表示用户设了"最暗"，那就一直黑 */
+static void backlight_fade_in(int target)
+{
+    if (target <= 0) {
+        bsp_backlight_set(0);
+        return;
+    }
+
+    s_fade_target = (target > 100) ? 100 : target;
+    s_fade_cur    = 0;
+    bsp_backlight_set(0);
+
+    if (!s_fade_timer) {
+        const esp_timer_create_args_t ta = {
+            .callback = bl_fade_cb,
+            .name     = "bl_fade",
+        };
+        if (esp_timer_create(&ta, &s_fade_timer) != ESP_OK) {
+            /* 建不出定时器就直接亮：宁可没有淡入，也不能黑着屏 */
+            bsp_backlight_set(s_fade_target);
+            ESP_LOGW(TAG, "淡入定时器创建失败，直接点亮 %d%%", s_fade_target);
+            return;
+        }
+    }
+    if (esp_timer_start_periodic(s_fade_timer, BL_FADE_STEP_MS * 1000) != ESP_OK) {
+        bsp_backlight_set(s_fade_target);
+        ESP_LOGW(TAG, "淡入定时器启动失败，直接点亮 %d%%", s_fade_target);
+    }
+}
+
 esp_err_t app_start(void)
 {
     ESP_LOGI(TAG, "================ 智能手表 v%s 启动 ================",
@@ -543,12 +614,14 @@ esp_err_t app_start(void)
         ESP_LOGW(TAG, "运动服务初始化失败，步数将显示为 --");
     }
 
-    /* ---------- 4. 把设置里的亮度真正应用出去 ---------- */
+    /* ---------- 4. 记下目标亮度，但**先别点亮**（v0.6.1） ----------
+     *
+     * 原来这里直接 bsp_backlight_set(bright)：屏幕一亮，LVGL 首帧可能还没画完，
+     * 用户会看到花屏或半成品界面。现在保持黑屏，等界面装好再淡入（见下面第 5.6 步）。
+     */
     const int bright = brightness_get();
-    if (bsp_backlight_set(bright) != ESP_OK) {
-        ESP_LOGW(TAG, "背光设置 %d%% 失败", bright);
-    }
-    ESP_LOGI(TAG, "亮度 %d%%", bright);
+    bsp_backlight_set(0);
+    ESP_LOGI(TAG, "亮度设置 %d%%（界面就绪后淡入）", bright);
 
     /* ---------- 5. 装配界面 ---------- */
     /*
@@ -582,6 +655,15 @@ esp_err_t app_start(void)
     }
 
     ui_port_unlock();
+
+    /* ---------- 5.6 界面已就绪 → 背光淡入（v0.6.1） ----------
+     *
+     * 放在这里（而不是更早）是有意的：此时首页已经建好，
+     * 淡入过程中露出来的就是**成品界面**，不会看到半成品或花屏。
+     * 注意：界面初始化失败时也照样点亮 —— 否则用户面对一块黑屏，
+     * 连"哪里出错了"都看不到（错误在串口日志里）。
+     */
+    backlight_fade_in(bright);
 
     /* ---------- 5.5 订阅"设置变了"事件 → 自动刷界面 ---------- */
     if (xTaskCreate(settings_event_task, "settings_ev", 3072, NULL, 3, NULL) != pdPASS) {
