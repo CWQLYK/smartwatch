@@ -29,10 +29,11 @@
 #include "watch_widgets.h"
 #include "watch_modal.h"
 #include "watch_strings.h"
+#include "watch_toast.h"
 
 
 #ifndef WATCH_FIRMWARE_VERSION
-#define WATCH_FIRMWARE_VERSION "0.6.1"
+#define WATCH_FIRMWARE_VERSION "0.7.0"
 #endif
 
 #define ROW_H         40
@@ -123,9 +124,30 @@ static lv_obj_t *make_row(lv_obj_t *parent, const char *title, const char *value
 }
 
 /* ==================== 建界面（模态构建回调） ==================== */
+
+/** @brief 切换"开机自动连 WiFi" */
+static void wifi_auto_cb(lv_event_t *e)
+{
+    (void)e;
+    const int cur = (int)watch_ui_setting_get(W_SETTING_WIFI_AUTO, 0);
+    const int next = cur ? 0 : 1;
+
+    if (watch_ui_setting_set(W_SETTING_WIFI_AUTO, next) != 0) {
+        watch_toast_show(W_STR_SETTING_SAVE_FAILED);
+        return;
+    }
+    /* 重建本页，让右侧的"开/关"立刻反映出来 */
+    w_modal_refresh();
+    watch_toast_show_fmt("%s：%s", W_STR_WIFI_AUTO_CONNECT,
+                         next ? W_STR_ON : W_STR_OFF);
+}
+
 static void settings_build(lv_obj_t *parent, void *user)
 {
     (void)user;
+
+    /* 每次 build 都重读一遍，这样切开关后 w_modal_refresh() 能反映新值 */
+    const int wifi_auto = (int)watch_ui_setting_get(W_SETTING_WIFI_AUTO, 0);
 
     /* ---------- 亮度（滑块）---------- */
     const int bright = watch_ui_brightness_get();
@@ -162,6 +184,17 @@ static void settings_build(lv_obj_t *parent, void *user)
         lv_obj_set_style_text_color(ui.lb_rtc,
                                     tvalid ? W_COLOR_ACCENT : W_COLOR_WARN, 0);
     }
+
+    /*
+     * ---------- 开机自动连 WiFi（★ v0.7.0）----------
+     *
+     * 默认**关**（见 settings.c 的 s_desc[SETTINGS_WIFI_AUTO] 说明）：
+     * 以前一开机就拿存着的凭据去连，AP 不在时会一直卡在"连接中"，
+     * 用户既没让它连、也没法退出。现在联网是用户的动作，
+     * 这个开关留给"我就是想让它开机自动连"的人。
+     */
+    make_row(parent, W_STR_WIFI_AUTO_CONNECT,
+             wifi_auto ? W_STR_ON : W_STR_OFF, wifi_auto_cb, NULL);
 }
 
 void watch_settings_open(void)

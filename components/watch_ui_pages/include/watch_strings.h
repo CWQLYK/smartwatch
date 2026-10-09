@@ -27,9 +27,17 @@
  * ★ v0.6.1 追加 16 个（新增的 console 命令 / 背光淡入日志里用到的字）：
  *     亲优危史各塞它支故核溃说越险隔   ← app_console.c（taskmem/stats/bt/crash）
  *     淡                              ← app.c（背光淡入）
+ *
+ * ★ v0.7.0 追加 8 个：
+ *     条                              ← watch_toast.c（提示条的就绪日志）
+ *     忘该彻底                        ← app_console.c（wifi forget / disconnect 的输出）
+ *     棋                              ← game_2048.c（就绪日志里的"棋盘"）
+ *     纬经                            ← weather_port.c / weather_service.c（日志）
+ *   注意：**注释里的中文也会被扫描**（脚本扫的是"所有非 ASCII 字面量"），
+ *   所以只要在 .c 里写了中文，不管是不是界面文案，都必须登记 —— 否则校验会红。
  *   处理流程：写到这里 → 跑 tools/gen_font.ps1 -Force → 三条校验脚本会确认覆盖。
  * ================================================================== */
-#define W_STR_FONT_EXTRA  "提示凭亲优危史各塞它支故核溃说越险隔淡"
+#define W_STR_FONT_EXTRA  "提示凭亲优危史各塞它支故核溃说越险隔淡条忘该彻底棋纬经"
 
 #ifdef __cplusplus
 extern "C" {
@@ -218,7 +226,93 @@ static inline const char *w_weekday_text(int iso_weekday)
 #define W_STR_WIFI_LOCK         "[锁]"
 #define W_STR_WIFI_POWER_WARN   "WiFi 已开，耗电较大"
 #define W_STR_WIFI_POWER_HINT   "WiFi 保持连接会比较费电。不用的时候请回到本页点【断开】，可以明显延长续航。"
+/* ---- v0.7.0：多槽位（最多记住 5 个网络）---- */
+#define W_STR_WIFI_SAVED_COUNT_FMT "已记住 %d/%d 个网络，点它们不用再输密码"
 #define W_STR_OK                "知道了"
+
+/* ---- v0.7.0：计算器 ----
+ *
+ * ⚠️ 这里**刻意只用已登记的字**：界面上不设"确认/等于"之类按钮
+ *    （按 `=` 直接出结果），错误提示也复用"算式不完整/不能除以零/结果太大"，
+ *    所以新增的全是 ASCII，**不需要重跑字库**。
+ *    哪天要加中文按钮，记得走 gen_font.ps1 -Force + 三条校验。 */
+#define W_STR_CALC_TITLE        "计算器"
+#define W_STR_FUNC_CALC_SUB     "加减乘除与百分号"
+#define W_STR_CALENDAR_SUB      "看日期，切年月"
+
+/* ---- v0.7.0：新增的「工具」轮播页 ----
+ *
+ * 为什么不塞进「功能列表」：那一页已经 5 行占满 251/256px，
+ * 加第 6 行要 269px，会让"5 行一屏放下、上滑开控制中心"这条约束失效
+ * （自检里有断言守着）。所以按游戏列表同样的模式**单开一页**：
+ * 列表行 → 模态子页。 */
+#define W_STR_TOOLS             "工具"
+#define W_STR_TOOLS_HINT        "选中一个开始用。返回点右上角。"
+
+/* ---- v0.7.0：天气（v0.7.0 新增，图标用图元自绘、零位图资源）---- */
+#define W_STR_WX_TITLE          "天气"
+#define W_STR_WX_SUB            "7 天预报（Open-Meteo）"
+#define W_STR_WX_GET            "获取天气"
+#define W_STR_WX_CITY           "城市坐标"
+#define W_STR_WX_FETCHING       "正在获取…"
+#define W_STR_WX_FAILED         "获取失败，先连 WiFi"
+#define W_STR_WX_NO_DATA        "点下面【获取天气】"
+#define W_STR_WX_UNAVAILABLE    "天气不可用"
+#define W_STR_WX_CACHED_HINT    "缓存数据，可点获取刷新"
+#define W_STR_WX_BUSY           "正在获取中，请稍候"
+/* 图标类别名（两个字，省横向空间）*/
+#define W_STR_WX_SUNNY          "晴"
+#define W_STR_WX_CLOUDY         "多云"
+#define W_STR_WX_OVERCAST       "阴"
+#define W_STR_WX_FOG            "雾"
+#define W_STR_WX_RAIN           "雨"
+#define W_STR_WX_SNOW           "雪"
+#define W_STR_WX_STORM          "雷"
+#define W_STR_WX_UNKNOWN        "未知"
+
+/* ---- v0.7.0：城市坐标设置页 ---- */
+#define W_STR_WX_CITY_TITLE     "城市坐标"
+#define W_STR_WX_LAT_LABEL      "纬度"
+#define W_STR_WX_LON_LABEL      "经度"
+#define W_STR_WX_CITY_HINT      "点数字改，格式如 31.23000。默认是上海。"
+#define W_STR_WX_SAVED          "坐标已保存，回上一页点获取天气"
+#define W_STR_WX_BAD_VALUE      "格式不对，请重新输入"
+
+/*
+ * 星期名（v0.7.0）。
+ *
+ * ★ 放在这里（而不是各页面自己写数组）的原因：
+ *   字库生成脚本**只扫字符串字面量**，而这些名字如果在 .c 里
+ *   以 `const char *names[7] = {...}` 出现，虽然也能扫到，
+ *   但日历页和以后可能新增的页面会各写一份、容易漏。
+ *   集中定义 + 两处引用，扫描和校对都只有一处。
+ */
+#define W_STR_WEEKDAY_0         "日"
+#define W_STR_WEEKDAY_1         "一"
+#define W_STR_WEEKDAY_2         "二"
+#define W_STR_WEEKDAY_3         "三"
+#define W_STR_WEEKDAY_4         "四"
+#define W_STR_WEEKDAY_5         "五"
+#define W_STR_WEEKDAY_6         "六"
+
+/* ---- v0.7.0：2048 的游戏提示（在 games/game_2048.c 里当字面量用）----
+ *
+ * 那句提示是"滑动合并相同数字"，其中"合"字只出现在游戏文件里，
+ * 生成脚本扫得到字符串字面量，所以这里不用重复登记 —— 这条注释只是
+ * 说明"游戏本体里的中文从哪来"（同一套流水线）。
+ * 但**日志里**用到的"棋"字得登记（见 W_STR_FONT_EXTRA）。 */
+
+/* ---- v0.7.0：日历 ----
+ *
+ * 星期名用上面的 W_STR_WEEKDAY_x（和天气页共用一份）。
+ * "今天"这两个字由 W_STR_CALENDAR_TODAY_FMT 带进字库。 */
+#define W_STR_CALENDAR_TITLE    "日历"
+#define W_STR_CALENDAR_TODAY_FMT "今天 %04d-%02d-%02d"
+#define W_STR_CALENDAR_NO_TIME  "时间未校准，请先校时再来看日历"
+
+/* ---- v0.7.0：设置页的"开机自动连 WiFi"开关 ---- */
+#define W_STR_WIFI_AUTO_CONNECT "开机自动连WiFi"
+#define W_STR_SETTING_SAVE_FAILED "设置保存失败"
 
 /* ==================================================================
  * v0.5.0 新增文案（功能列表页 / 时钟页 / 蜂鸣器测试 / 全局提醒）

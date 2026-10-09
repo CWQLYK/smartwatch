@@ -114,6 +114,24 @@ typedef struct {
     int  (*forget)(void);
     void (*get_status)(w_wifi_status_t *out);
     void (*get_saved_ssid)(char *out, int max);
+
+    /**
+     * @brief 取"已保存的第 idx 个网络"（v0.7.0，多槽位）
+     *
+     * @param idx   0 起；越界返回非 0
+     * @param ssid  输出 SSID
+     * @param max   缓冲长度
+     * @return 0 = 这一槽有内容；非 0 = 没有
+     *
+     * @note 为什么不直接改 `get_saved_ssid` 的签名：那个取的是
+     *       "上次成功那一槽"，界面上多处靠它判断"点这个网络要不要问密码"，
+     *       改签名会波及所有调用点。多一个按索引取的口子更安全。
+     *       **任一个没接（模拟器就是）时界面必须能正常工作** —— 见各页的判空。
+     */
+    int  (*get_saved_ssid_at)(int idx, char *ssid, int max);
+
+    /** @brief 已保存的网络数量（v0.7.0，界面显示"已记住 N 个网络"）*/
+    int  (*saved_count)(void);
     int  (*sync_time)(void);
 } w_wifi_hooks_t;
 
@@ -124,6 +142,57 @@ void w_platform_set_wifi_hooks(const w_wifi_hooks_t *hooks);
 
 /** @brief 取 WiFi 钩子；没注册返回 NULL（界面必须判空） */
 const w_wifi_hooks_t *w_platform_wifi(void);
+
+/* ==================== 天气（v0.7.0，对应 components/weather）====================
+ *
+ * ## 为什么字段名/结构要和 weather_service.h 对齐
+ *
+ * 界面层**不能** include `weather_service.h`（那个会带进 esp_http_client 等
+ * ESP-IDF 头，PC 模拟器就编不过了）。所以这里再声明一份等价结构，
+ * 由 app.c 在装配时逐字段搬运（和 wifi 那套"字段对齐"的约定完全一样）。
+ *
+ * ## 为什么状态里要有 fetching / failed
+ *
+ * 依据 `wifi_status_t` 的既有教训（见上面 syncing/sync_failed 的注释）：
+ * **用户点了按钮之后界面必须有反馈**。"点了没反应"是这个项目反复踩的坑。
+ */
+
+/** @brief 预报天数（要和 weather_service.h 的 WEATHER_DAYS 一致）*/
+#define W_WEATHER_DAYS   7
+
+/** @brief 一天的预报（字段对齐 weather_day_t）*/
+typedef struct {
+    char   date[6];     /**< "MM/DD" */
+    int8_t wmo;         /**< WMO 天气代码 */
+    int8_t tmax;        /**< 最高温 ℃ */
+    int8_t tmin;        /**< 最低温 ℃ */
+} w_weather_day_t;
+
+/** @brief 天气状态快照（字段对齐 weather_status_t）*/
+typedef struct {
+    bool            valid;          /**< 有没有可用的缓存 */
+    uint8_t         count;          /**< 有效天数 1..7 */
+    w_weather_day_t days[W_WEATHER_DAYS];
+    uint32_t        fetched_epoch;  /**< 上次抓取时间（0 = 从未）*/
+    bool            fetching;       /**< 正在抓取 → 界面转圈 */
+    bool            failed;         /**< 上次失败，把原因说出来 */
+} w_weather_status_t;
+
+/** @brief 天气钩子表（字段对齐 weather_service 的对外接口）*/
+typedef struct {
+    /** @brief 触发一次抓取（非阻塞），0 = 已受理 */
+    int  (*refresh)(void);
+    /** @brief 取状态快照（服务内加锁，任何任务都能调） */
+    void (*get_status)(w_weather_status_t *out);
+    /** @brief WMO 代码 → 图标类别（0 晴 1 多云 2 阴 3 雾 4 雨 5 雪 6 雷） */
+    int  (*wmo_class)(int wmo);
+} w_weather_hooks_t;
+
+/** @brief 注册天气钩子（app 层调；模拟器不调） */
+void w_platform_set_weather_hooks(const w_weather_hooks_t *hooks);
+
+/** @brief 取天气钩子；没注册返回 NULL（界面必须判空 → 显示"不支持"） */
+const w_weather_hooks_t *w_platform_weather(void);
 
 /* ==================== IMU 录制相关（对应 components/imu_logger） ==================== */
 

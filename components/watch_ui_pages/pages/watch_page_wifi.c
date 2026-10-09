@@ -35,6 +35,7 @@
 #include "watch_platform.h"
 #include "watch_modal.h"
 #include "watch_keyboard.h"
+#include "watch_toast.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -66,6 +67,14 @@ static const char *TAG = "WIFIPAGE";
  *    再把指针交给回调。槽位数只要 >= 屏上能显示的行数即可。
  */
 #define WIFI_SSID_STORE  W_WIFI_SCAN_MAX
+
+/**
+ * @brief 界面最多列几个"已保存的网络"（v0.7.0 多槽位）
+ *
+ * @note 要和 `wifi_service.c` 的 `WIFI_SLOT_MAX` 对齐。
+ *       这里定 5 是"上限"，实际有几条由 `get_saved_ssid_at()` 返回是否越界决定。
+ */
+#define WIFI_SAVED_MAX   5
 
 static struct {
     lv_obj_t *list;         /* 列表容器 */
@@ -99,6 +108,15 @@ static struct {
     bool           last_syncing;
     bool           last_sync_failed;
     bool           last_synced;
+
+    /*
+     * ★ v0.7.0：toast 用的"上次已经提示过的状态"。
+     *
+     * 为什么不能直接用 last_state：last_state 在**每次重建时**都会被改写成当前值
+     * （wifi_page_build 里也是），所以拿它判断"是不是刚变了"会在重建后丢失边沿。
+     * 这里单独记一份只增不减的"已提示过"状态，保证一次状态变化只弹一次 toast。
+     */
+    w_wifi_state_t toasted_state;
 } ui;
 
 /* ==================================================================
@@ -118,6 +136,30 @@ static const w_wifi_hooks_t *hooks(void)
     return w_platform_wifi();
 }
 
+/**
+ * @brief 这个 SSID 是不是已经存在某个槽位里（v0.7.0 多槽位）
+ *
+ * @note 钩子没接（模拟器/旧实现）时退回到"只比 ui.saved_ssid"，
+ *       所以这条路上不会因为新钩子缺失而误判。
+ */
+static bool wifi_ssid_is_saved(const w_wifi_hooks_t *h, const char *ssid)
+{
+    if (!h || !h->get_saved_ssid_at || !ssid || !ssid[0]) {
+        return false;
+    }
+    char tmp[W_WIFI_SSID_MAX];
+    for (int i = 0; i < WIFI_SAVED_MAX; i++) {
+        tmp[0] = '\0';
+        if (h->get_saved_ssid_at(i, tmp, sizeof(tmp)) != 0) {
+            break;                  /* 越界（槽位是连续的）*/
+        }
+        if (strcmp(tmp, ssid) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /** @brief 清空列表 */
 static void list_clear(void)
 {
@@ -133,6 +175,40 @@ static void set_status(const char *text, lv_color_t color)
     }
     w_label_set_text_auto(ui.status, text);
     lv_obj_set_style_text_color(ui.status, color, 0);
+}
+
+/* ==================================================================
+ * ★ v0.7.0：通用 toast —— WiFi 的状态变化给一条"屏幕顶部一闪而过"的反馈
+ *
+ * 为什么需要：WiFi 是全项目反馈最弱的一环 —— 连接成功只改一行小字，
+ * 失败只有页面内的 popup，而**用户此刻往往已经滑走去看别的页面了**
+ * （比如点了连接就去表盘看时间）。toast 挂在 layer_top 上，
+ * 不管当前在哪个页面都能看见。
+ *
+ * 规则：一次状态**变化**只提示一次（用 ui.toasted_state 记边沿）。
+ * ================================================================== */
+static void toast_state_change(w_wifi_state_t st, const w_wifi_status_t *s)
+{
+    if (st == ui.toasted_state) {
+        return;                     /* 没有变化，或者已经提示过 */
+    }
+    ui.toasted_state = st;
+
+    switch (st) {
+    case W_WIFI_CONNECTED:
+        /* 连上是"好消息"，把 SSID 带上，用户一眼知道连的是哪个 */
+        watch_toast_show_fmt("%s %s", W_STR_WIFI_CONNECTED,
+                             (s && s->ssid[0]) ? s->ssid : "");
+        break;
+
+    case W_WIFI_FAILED:
+        watch_toast_show(W_STR_WIFI_FAILED);
+        break;
+
+    default:
+        /* IDLE / CONNECTING 不打扰用户（他正在输密码/等待，页面本身有提示）*/
+        break;
+    }
 }
 
 /* ==================================================================
@@ -268,8 +344,13 @@ static void ap_clicked(lv_event_t *e)
      *
      * 传 NULL 表示"用已保存的密码"，服务侧会从 NVS 回填
      * （见 hook_connect 里的 eff_pass 逻辑）。
+     *
+     * ★ v0.7.0：多槽位之后要**查遍所有槽**，不能只看 `ui.saved_ssid`
+     *   （那只是"上次成功那一槽"）—— 否则家里/公司两个网里
+     *   只有一个能"免密码直连"，另一个每次都要重输。
      */
-    const bool saved = (ui.saved_ssid[0] && strcmp(ui.saved_ssid, ssid) == 0);
+    const bool saved = wifi_ssid_is_saved(h, ssid) ||
+                       (ui.saved_ssid[0] && strcmp(ui.saved_ssid, ssid) == 0);
 
     if (secure && !saved) {
         ask_password(ssid);
@@ -307,6 +388,24 @@ static void show_scan_list(void)
     lv_obj_t *tip = w_label_create(ui.list, W_STR_WIFI_PICK_AP, watch_font_cn(14),
                                    W_COLOR_TEXT_DIM);
     lv_obj_set_width(tip, LV_PCT(100));
+
+    /*
+     * ★ v0.7.0：多槽位之后，告诉用户"我已经记住了几个网络"。
+     *
+     *   为什么要有这行：以前只存一个网，"点已保存的网络不用输密码"
+     *   是隐含行为；现在能存 5 个，用户需要知道到底记住了哪些、
+     *   还有几个空位（满了会覆盖最旧的那个）。
+     */
+    if (h->saved_count) {
+        const int sc = h->saved_count();
+        if (sc > 0) {
+            lv_obj_t *sl = w_label_create_auto(ui.list, "", W_FONT_SMALL, 13,
+                                               W_COLOR_TEXT_MUTE);
+            lv_obj_set_width(sl, LV_PCT(100));
+            w_label_set_text_fmt_auto(sl, W_STR_WIFI_SAVED_COUNT_FMT,
+                                      sc, WIFI_SAVED_MAX);
+        }
+    }
 
     for (int i = 0; i < n; i++) {
         lv_obj_t *row = w_card_create_clickable(ui.list, 0, 0, LV_PCT(100), 42);
@@ -411,6 +510,12 @@ static void poll_cb(lv_timer_t *t)
             ESP_LOGI(TAG, "状态 %d -> %d（对时 %d/%d/%d），重建页面",
                      (int)ui.last_state, (int)st.state,
                      (int)st.syncing, (int)st.sync_failed, (int)st.time_synced);
+            /*
+             * ★ v0.7.0：toast 要在**改 last_state 之前**判定边沿，
+             *   而且它挂在自己的 layer 上，随后那次 w_modal_refresh()
+             *   把整页重建也不会影响它。
+             */
+            toast_state_change(st.state, &st);
             ui.last_state    = st.state;
             ui.last_syncing  = st.syncing;
             ui.last_sync_failed = st.sync_failed;
@@ -446,6 +551,12 @@ static void poll_cb(lv_timer_t *t)
     ui.scanning = false;
     set_status(W_STR_WIFI_SCAN_DONE, W_COLOR_TEXT_DIM);
     show_scan_list();
+
+    /*
+     * ★ v0.7.0：扫描完成也给一条 toast。
+     *   扫描要 2~4 秒，用户很可能已经滑走；toast 会告诉他"可以回来选网络了"。
+     */
+    watch_toast_show(W_STR_WIFI_SCAN_DONE);
 }
 
 /**
@@ -706,6 +817,15 @@ static void wifi_page_build(lv_obj_t *parent, void *user)
     ui.last_syncing     = st.syncing;
     ui.last_sync_failed = st.sync_failed;
     ui.last_synced      = st.time_synced;
+
+    /*
+     * ★ v0.7.0：toast 的"边沿基准"。
+     *
+     * 进页面时就把当前状态记为"已提示过" —— 否则"本来就已连上"的用户
+     * 一进 WiFi 页就会收到一条"已连接"的 toast，那是**旧闻不是新闻**。
+     * 只有进页面**之后**发生的状态变化才值得提醒。
+     */
+    ui.toasted_state    = st.state;
 
     /* 状态行 */
     ui.status = w_label_create_auto(parent, "", watch_font_cn(14), 14,

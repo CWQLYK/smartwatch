@@ -17,6 +17,7 @@ static const w_rec_hooks_t    *s_rec    = NULL;
 static const w_time_hooks_t   *s_time   = NULL;
 static const w_screen_hooks_t *s_screen = NULL;
 static const w_buzzer_hooks_t *s_buzzer = NULL;
+static const w_weather_hooks_t *s_weather = NULL;   /* ★ v0.7.0 天气 */
 
 void w_platform_set_wifi_hooks(const w_wifi_hooks_t *hooks)
 {
@@ -71,6 +72,19 @@ void w_platform_set_buzzer_hooks(const w_buzzer_hooks_t *hooks)
 const w_buzzer_hooks_t *w_platform_buzzer(void)
 {
     return s_buzzer;
+}
+
+/* ★ v0.7.0：天气。和上面几组完全同构 —— 存个指针 + 判空。
+ * 界面拿不到钩子时（模拟器）要显示"天气不可用"，而不是空白页。*/
+void w_platform_set_weather_hooks(const w_weather_hooks_t *hooks)
+{
+    s_weather = hooks;
+    ESP_LOGI(TAG, "天气钩子%s", hooks ? "已注册" : "已清除");
+}
+
+const w_weather_hooks_t *w_platform_weather(void)
+{
+    return s_weather;
 }
 
 /* ==================== 便捷封装 ==================== */

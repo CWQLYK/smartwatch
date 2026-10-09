@@ -34,6 +34,7 @@
 #include "buzzer.h"
 #include "power.h"
 #include "wifi_service.h"
+#include "weather_service.h"   /* ★ v0.7.0 天气（只在这个装配层 include） */
 #include "app_console.h"
 
 static const char *TAG = "APP";
@@ -46,7 +47,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.6.1"
+#define APP_VERSION_STR  "0.7.0"
 
 const char *app_version(void)
 {
@@ -203,6 +204,25 @@ static int setting_get(const char *key, int def)
     if (strcmp(key, W_SETTING_DINO_BEST) == 0) {
         return (int)settings_get_or_default(SETTINGS_DINO_BEST);
     }
+    /* ---- v0.7.0 WiFi 开机自动连接 ---- */
+    if (strcmp(key, W_SETTING_WIFI_AUTO) == 0) {
+        return (int)settings_get_or_default(SETTINGS_WIFI_AUTO);
+    }
+    /* ---- v0.7.0 时区（日历页要把 UTC 换算成本地日期）---- */
+    if (strcmp(key, W_SETTING_TZ) == 0) {
+        return (int)settings_get_or_default(SETTINGS_TIMEZONE);
+    }
+    /* ---- v0.7.0 2048 存档 ---- */
+    if (strcmp(key, W_SETTING_2048_BEST) == 0) {
+        return (int)settings_get_or_default(SETTINGS_2048_BEST);
+    }
+    /* ---- v0.7.0 天气经纬度 ---- */
+    if (strcmp(key, W_SETTING_WX_LAT) == 0) {
+        return (int)settings_get_or_default(SETTINGS_WX_LAT);
+    }
+    if (strcmp(key, W_SETTING_WX_LON) == 0) {
+        return (int)settings_get_or_default(SETTINGS_WX_LON);
+    }
     ESP_LOGW(TAG, "未知设置项键名 '%s'，返回默认值 %d", key, def);
     return def;
 }
@@ -235,6 +255,21 @@ static int setting_set(const char *key, int value)
     /* ---- v0.6.0 游戏存档 ---- */
     else if (strcmp(key, W_SETTING_DINO_BEST) == 0) {
         err = settings_set(SETTINGS_DINO_BEST, value);
+    }
+    /* ---- v0.7.0 WiFi 开机自动连接 ---- */
+    else if (strcmp(key, W_SETTING_WIFI_AUTO) == 0) {
+        err = settings_set(SETTINGS_WIFI_AUTO, value);
+    }
+    /* ---- v0.7.0 2048 存档 ---- */
+    else if (strcmp(key, W_SETTING_2048_BEST) == 0) {
+        err = settings_set(SETTINGS_2048_BEST, value);
+    }
+    /* ---- v0.7.0 天气经纬度 ---- */
+    else if (strcmp(key, W_SETTING_WX_LAT) == 0) {
+        err = settings_set(SETTINGS_WX_LAT, value);
+    }
+    else if (strcmp(key, W_SETTING_WX_LON) == 0) {
+        err = settings_set(SETTINGS_WX_LON, value);
     } else {
         ESP_LOGW(TAG, "未知设置项键名 '%s'", key);
         return -1;
@@ -305,6 +340,61 @@ static bool s_wifi_hooks_ready = false;
 static char s_info_heap[24]   = "--";
 static char s_info_psram[24]  = "--";
 static char s_info_uptime[24] = "--";
+
+/* ---------- 天气钩子（★ v0.7.0）----------
+ *
+ * 界面层不能 include weather_service.h（会带进 esp_http_client 等 IDF 头），
+ * 所以这里把服务的接口**逐字段搬**成 w_weather_hooks_t。
+ * 和 wifi 那套"字段对齐"的约定完全一样。
+ *
+ * ⚠️ get_status 这里必须**做结构体转换**（weather_status_t → w_weather_status_t），
+ *    不能直接把指针转过去 —— 两个结构体的字段顺序/类型虽然现在一致，
+ *    但它们的对齐（padding）不保证相同，强转是未定义行为。
+ */
+static void weather_hook_get_status(w_weather_status_t *out)
+{
+    if (!out) {
+        return;
+    }
+    weather_status_t src;
+    weather_service_get_status(&src);
+
+    memset(out, 0, sizeof(*out));
+    out->valid         = src.valid;
+    out->count         = src.count;
+    out->fetched_epoch = src.fetched_epoch;
+    out->fetching      = src.fetching;
+    out->failed        = src.failed;
+    for (int i = 0; i < W_WEATHER_DAYS && i < WEATHER_DAYS; i++) {
+        out->days[i].date[0] = src.days[i].date[0];
+        out->days[i].date[1] = src.days[i].date[1];
+        out->days[i].date[2] = src.days[i].date[2];
+        out->days[i].date[3] = src.days[i].date[3];
+        out->days[i].date[4] = src.days[i].date[4];
+        out->days[i].date[5] = '\0';
+        out->days[i].wmo     = src.days[i].wmo;
+        out->days[i].tmax    = src.days[i].tmax;
+        out->days[i].tmin    = src.days[i].tmin;
+    }
+}
+
+static int weather_hook_refresh(void)
+{
+    return weather_service_refresh();
+}
+
+static int weather_hook_wmo_class(int wmo)
+{
+    /* 声明在 weather_service.c 里；它不需要任何 IDF 类型，纯查表 */
+    extern int weather_wmo_class(int wmo);
+    return weather_wmo_class(wmo);
+}
+
+static const w_weather_hooks_t s_weather_hooks = {
+    .refresh    = weather_hook_refresh,
+    .get_status = weather_hook_get_status,
+    .wmo_class  = weather_hook_wmo_class,
+};
 
 /* ---------- IMU 录制钩子 ---------- */
 static bool rec_hook_available(void)
@@ -647,6 +737,7 @@ esp_err_t app_start(void)
     w_platform_set_time_hooks(&s_time_hooks);
     w_platform_set_buzzer_hooks(&s_buzzer_hooks);
     w_platform_set_wifi_hooks(wifi_service_get_hooks());
+    w_platform_set_weather_hooks(&s_weather_hooks);   /* ★ v0.7.0 天气 */
 
     /* 建首页并订阅数据 */
     esp_err_t ui_err = watch_ui_init(&s_provider, &watch_page_home, 4);
@@ -687,6 +778,15 @@ esp_err_t app_start(void)
     }
     wifi_service_set_time_cb(on_sntp_synced);
     s_wifi_hooks_ready = true;
+
+    /*
+     * ★ v0.7.0 天气服务：只建状态 + 读缓存，**开机不联网**。
+     *   联网是用户在天气页点"获取"才发生（和参考工程一致）——
+     *   开机自动请求会因为"WiFi 还没连上"而必然失败一次。
+     */
+    if (weather_service_init() != ESP_OK) {
+        ESP_LOGW(TAG, "天气服务启动失败，天气页会提示不可用");
+    }
 
     /* ---------- 5.9 系统信息注入给开发人员页 ---------- */
     snprintf(s_info_heap, sizeof(s_info_heap), "%u KB",

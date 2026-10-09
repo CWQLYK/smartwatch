@@ -707,6 +707,11 @@ const w_game_t *w_game_debug_game(void)
     return s_game;
 }
 
+lv_obj_t *w_game_debug_canvas(void)
+{
+    return s_canvas;
+}
+
 int w_game_debug_fill_canvas(int idx)
 {
     if (!s_buf || !s_canvas) {

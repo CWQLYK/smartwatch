@@ -693,7 +693,29 @@ static int cmd_wifi(int argc, char **argv)
     if (strcmp(sub, "disconnect") == 0) {
         const wifi_hooks_t *h = wifi_service_get_hooks();
         h->disconnect();
-        printf("已断开并清除保存的密码\n");
+        printf("已断开（保存的密码仍留着，下次还能自动重连）\n");
+        return 0;
+    }
+    /*
+     * ★ v0.7.0：补上 forget。
+     *
+     *   这个子命令以前只写在 help 串里、**没有实现**（交接文档 §10 #4）：
+     *   底下 `hook_forget()` 早就写好了、也挂进了 hooks，只是命令行没接线。
+     *   它和 disconnect 是**两个不同的意图**（源码注释里写着）：
+     *     disconnect = 先不连了，密码留着
+     *     forget     = 彻底忘掉这个网，下次要重新输密码
+     */
+    if (strcmp(sub, "forget") == 0) {
+        const wifi_hooks_t *h = wifi_service_get_hooks();
+        if (!h->forget) {
+            printf("本版本不支持 forget\n");
+            return 1;
+        }
+        if (h->forget() != 0) {
+            printf("WiFi 没启动（先执行 wifi on）\n");
+            return 1;
+        }
+        printf("已忘掉该网络（保存的凭据已清除，下次要重新输密码）\n");
         return 0;
     }
     if (strcmp(sub, "reset") == 0) {
@@ -712,7 +734,7 @@ static int cmd_wifi(int argc, char **argv)
         return 0;
     }
 
-    printf("可用: wifi on|status|scan|connect <SSID> [密码]|disconnect|sync\n");
+    printf("可用: wifi on|status|scan|connect <SSID> [密码]|disconnect|forget|reset|sync\n");
     return 1;
 }
 

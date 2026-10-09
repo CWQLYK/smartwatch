@@ -31,6 +31,7 @@
 #include "watch_strings.h"
 #include "watch_widgets.h"
 #include "dino_game.h"
+#include "game_2048.h"
 
 static const char *TAG = "GAMEPAGE";
 
@@ -43,6 +44,7 @@ typedef struct {
 
 static const game_entry_t k_games[] = {
     { &dino_game },
+    { &game_2048 },     /* v0.7.0：第二款。宿主外壳一行都不用改 */
 };
 
 #define GAME_COUNT   ((int)(sizeof(k_games) / sizeof(k_games[0])))

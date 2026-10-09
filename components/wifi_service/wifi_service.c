@@ -33,15 +33,45 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "settings.h"       /* ★ v0.7.0：读写 SETTINGS_WIFI_AUTO（开机自动连接开关）*/
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
 static const char *TAG = "WIFI";
 
+/*
+ * ==================== NVS 键名 ====================
+ *
+ * ★ v0.7.0：从"单槽位"扩成**多槽位**（最多 WIFI_SLOT_MAX 组）。
+ *
+ * 布局是**向后兼容**的：
+ *
+ *   ssid / pass        旧键，保留不动（迁移来源）
+ *   ssid1..ssid5       新槽位
+ *   pass1..pass5       新槽位
+ *   slot_cnt (u8)      槽位计数 —— 同时兼作"是否已迁移"的标志
+ *   last_ok (u8)       上次连上的槽号（开机优先试它）
+ *
+ * 首启迁移：`ssid` 非空且 `slot_cnt` 不存在 → 拷进槽 1，写 slot_cnt。
+ * 旧键**不删**（万一以后要回退老固件，还能读到）。
+ */
 #define WIFI_NVS_NS     "wifi"
 #define WIFI_NVS_SSID   "ssid"
 #define WIFI_NVS_PASS   "pass"
+#define WIFI_NVS_SLOTCNT "slot_cnt"
+#define WIFI_NVS_LASTOK  "last_ok"
+
+/** @brief 最多存几个网络 */
+#define WIFI_SLOT_MAX   5
+/** @brief 槽位无效的哨兵 */
+#define WIFI_SLOT_NONE  0xFF
+
+/** @brief 拼一个槽位的 NVS 键名（键名上限 15 字符，"ssid5" 足够短） */
+static void slot_key(char *buf, size_t len, const char *prefix, int slot)
+{
+    snprintf(buf, len, "%s%d", prefix, slot + 1);
+}
 
 /* SNTP 服务器：国内可达性好的两个 */
 #define SNTP_SERVER_1   "ntp.aliyun.com"
@@ -86,49 +116,351 @@ static inline void unlock(void)
     }
 }
 
-/* ==================== NVS 凭据 ==================== */
+/* ==================== NVS 凭据（多槽位）==================== */
+
+/** @brief 槽位是否占用（SSID 非空即算占用）*/
+static bool creds_slot_used(nvs_handle_t h, int slot)
+{
+    char k[16];
+    slot_key(k, sizeof(k), "ssid", slot);
+    size_t n = 0;
+    return nvs_get_str(h, k, NULL, &n) == ESP_OK && n > 1;
+}
+
+/** @brief 读一个槽位；@return ESP_OK = 有内容 */
+static esp_err_t creds_get_slot(nvs_handle_t h, int slot,
+                                char *ssid, size_t ssid_len,
+                                char *pass, size_t pass_len)
+{
+    char ks[16], kp[16];
+    slot_key(ks, sizeof(ks), "ssid", slot);
+    slot_key(kp, sizeof(kp), "pass", slot);
+
+    size_t n = ssid_len;
+    esp_err_t err = nvs_get_str(h, ks, ssid, &n);
+    if (err != ESP_OK) {
+        ssid[0] = '\0';
+        pass[0] = '\0';
+        return err;
+    }
+    n = pass_len;
+    if (nvs_get_str(h, kp, pass, &n) != ESP_OK) {
+        pass[0] = '\0';             /* 开放网络：没存密码 */
+    }
+    return ESP_OK;
+}
+
+/** @brief 写一个槽位（覆盖）*/
+static esp_err_t creds_put_slot(nvs_handle_t h, int slot,
+                                const char *ssid, const char *pass)
+{
+    char ks[16], kp[16];
+    slot_key(ks, sizeof(ks), "ssid", slot);
+    slot_key(kp, sizeof(kp), "pass", slot);
+    esp_err_t err = nvs_set_str(h, ks, ssid ? ssid : "");
+    if (err != ESP_OK) {
+        return err;
+    }
+    return nvs_set_str(h, kp, pass ? pass : "");
+}
+
+/** @brief 只删一个槽位（★ 绝不能用 nvs_erase_all —— 那会把别的网络一起删掉）*/
+static esp_err_t creds_del_slot(nvs_handle_t h, int slot)
+{
+    char ks[16], kp[16];
+    slot_key(ks, sizeof(ks), "ssid", slot);
+    slot_key(kp, sizeof(kp), "pass", slot);
+    nvs_erase_key(h, ks);           /* 不存在时返回 NOT_FOUND，不算错 */
+    nvs_erase_key(h, kp);
+    return ESP_OK;
+}
+
+/**
+ * @brief 首启迁移：把旧单槽位（`ssid`/`pass`）搬进槽 1
+ *
+ * @note 只在 `slot_cnt` 不存在时做一次。旧键**保留**，
+ *       万一以后要回退老固件还能读到。
+ */
+static void creds_migrate(nvs_handle_t h)
+{
+    uint8_t cnt = 0;
+    if (nvs_get_u8(h, WIFI_NVS_SLOTCNT, &cnt) == ESP_OK) {
+        return;                     /* 已经迁移过 */
+    }
+
+    char ssid[WIFI_SSID_MAX] = { 0 };
+    char pass[WIFI_PASS_MAX] = { 0 };
+    size_t n = sizeof(ssid);
+    if (nvs_get_str(h, WIFI_NVS_SSID, ssid, &n) == ESP_OK && ssid[0]) {
+        n = sizeof(pass);
+        if (nvs_get_str(h, WIFI_NVS_PASS, pass, &n) != ESP_OK) {
+            pass[0] = '\0';
+        }
+        creds_put_slot(h, 0, ssid, pass);
+        nvs_set_u8(h, WIFI_NVS_SLOTCNT, 1);
+        nvs_set_u8(h, WIFI_NVS_LASTOK, 0);
+        ESP_LOGI(TAG, "凭据已迁移到多槽位：'%s' -> 槽 1", ssid);
+    } else {
+        nvs_set_u8(h, WIFI_NVS_SLOTCNT, 0);
+    }
+}
+
+/**
+ * @brief 按 SSID 找槽位
+ *
+ * @return 槽号；没找到返回 WIFI_SLOT_NONE；@param free_slot 可传 NULL，
+ *         不为 NULL 时顺带回传"第一个空槽"（也没有则 WIFI_SLOT_NONE）
+ */
+static int creds_find(const char *ssid, int *free_slot)
+{
+    int found = WIFI_SLOT_NONE;
+    int free_s = WIFI_SLOT_NONE;
+
+    if (free_slot) {
+        *free_slot = WIFI_SLOT_NONE;
+    }
+    if (!ssid || !ssid[0]) {
+        return WIFI_SLOT_NONE;
+    }
+
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return WIFI_SLOT_NONE;
+    }
+
+    for (int i = 0; i < WIFI_SLOT_MAX; i++) {
+        char s[WIFI_SSID_MAX] = { 0 };
+        char p[WIFI_PASS_MAX] = { 0 };
+        if (creds_get_slot(h, i, s, sizeof(s), p, sizeof(p)) != ESP_OK) {
+            if (free_s == WIFI_SLOT_NONE) {
+                free_s = i;
+            }
+            continue;
+        }
+        if (strcmp(s, ssid) == 0 && found == WIFI_SLOT_NONE) {
+            found = i;              /* 不 break：还要继续找空槽 */
+        }
+    }
+    nvs_close(h);
+
+    if (free_slot) {
+        *free_slot = free_s;
+    }
+    return found;
+}
+
+/**
+ * @brief 写入一份凭据：命中同名就更新，否则占一个空槽，全满则覆盖"非 last_ok"的第一个槽
+ *
+ * @note 这里刻意做**去重**：否则同一个 SSID 会占掉好几个槽，
+ *       开机遍历时会反复重试同一个网络。
+ */
 static esp_err_t creds_save(const char *ssid, const char *pass)
 {
+    if (!ssid || !ssid[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     nvs_handle_t h;
     esp_err_t err = nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
         return err;
     }
-    nvs_set_str(h, WIFI_NVS_SSID, ssid ? ssid : "");
-    nvs_set_str(h, WIFI_NVS_PASS, pass ? pass : "");
-    err = nvs_commit(h);
+    creds_migrate(h);
     nvs_close(h);
+
+    /* 先在只读的一趟里查"同名槽"和"第一个空槽" */
+    int free_s = WIFI_SLOT_NONE;
+    int slot = creds_find(ssid, &free_s);
+
+    if (nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    if (slot == WIFI_SLOT_NONE) {
+        if (free_s != WIFI_SLOT_NONE) {
+            slot = free_s;
+        } else {
+            /* 全满：覆盖"不是上次成功那一个"的第一个槽（尽量别毁掉能用的）*/
+            uint8_t last = 0;
+            nvs_get_u8(h, WIFI_NVS_LASTOK, &last);
+            slot = (last == 0) ? 1 : 0;
+            ESP_LOGW(TAG, "槽位已满，覆盖槽 %d", slot + 1);
+        }
+    }
+
+    err = creds_put_slot(h, slot, ssid, pass);
+    if (err == ESP_OK) {
+        uint8_t cnt = 0;
+        if (nvs_get_u8(h, WIFI_NVS_SLOTCNT, &cnt) != ESP_OK || cnt < (slot + 1)) {
+            nvs_set_u8(h, WIFI_NVS_SLOTCNT, (uint8_t)(slot + 1));
+        }
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    ESP_LOGI(TAG, "凭据已存入槽 %d：'%s'", slot + 1, ssid);
     return err;
 }
 
+/**
+ * @brief 读"上次成功那一槽"（没有就退化成槽 1）
+ *
+ * @note 开机自动重连用它：优先试上次连上的那个网络，
+ *       而不是死板地按槽号顺序。
+ */
 static esp_err_t creds_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
 {
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(WIFI_NVS_NS, NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        return err;                 /* 没存过 */
+    if (ssid && ssid_len) {
+        ssid[0] = '\0';
     }
-    size_t n = ssid_len;
-    err = nvs_get_str(h, WIFI_NVS_SSID, ssid, &n);
-    if (err == ESP_OK) {
-        n = pass_len;
-        esp_err_t e2 = nvs_get_str(h, WIFI_NVS_PASS, pass, &n);
-        if (e2 != ESP_OK) {
-            pass[0] = '\0';         /* 开放网络：没存密码 */
+    if (pass && pass_len) {
+        pass[0] = '\0';
+    }
+
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    creds_migrate(h);
+
+    uint8_t last = WIFI_SLOT_NONE;
+    nvs_get_u8(h, WIFI_NVS_LASTOK, &last);
+
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if (last < WIFI_SLOT_MAX) {
+        err = creds_get_slot(h, last, ssid, ssid_len, pass, pass_len);
+    }
+    if (err != ESP_OK) {
+        /* 没有 last_ok（或那一槽被删了）→ 按槽号找第一个有内容的 */
+        for (int i = 0; i < WIFI_SLOT_MAX; i++) {
+            err = creds_get_slot(h, i, ssid, ssid_len, pass, pass_len);
+            if (err == ESP_OK) {
+                break;
+            }
         }
     }
     nvs_close(h);
+
+    if (err == ESP_OK && ssid && ssid[0]) {
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+/**
+ * @brief 按槽号读（给界面列"已保存的网络"用）
+ *
+ * @return ESP_OK = 这一槽有内容
+ */
+static esp_err_t creds_load_slot(int slot, char *ssid, size_t ssid_len,
+                                 char *pass, size_t pass_len)
+{
+    if (slot < 0 || slot >= WIFI_SLOT_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    const esp_err_t err = creds_get_slot(h, slot, ssid, ssid_len, pass, pass_len);
+    nvs_close(h);
     return err;
 }
 
-static void creds_erase(void)
+/**
+ * @brief 删掉一个 SSID 对应的槽位
+ *
+ * @note ★ 这里**只删一个槽**，不再用 `nvs_erase_all`。
+ *       扩成多槽之后，原来那个 erase_all 会让"某一次认证失败"
+ *       把**全部**网络一起清掉（交接文档里记的那个地雷）。
+ */
+static void creds_erase_ssid(const char *ssid)
 {
     nvs_handle_t h;
-    if (nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_all(h);
-        nvs_commit(h);
-        nvs_close(h);
+    if (nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
     }
+
+    for (int i = 0; i < WIFI_SLOT_MAX; i++) {
+        char s[WIFI_SSID_MAX] = { 0 };
+        char p[WIFI_PASS_MAX] = { 0 };
+        if (creds_get_slot(h, i, s, sizeof(s), p, sizeof(p)) != ESP_OK) {
+            continue;
+        }
+        if (ssid && ssid[0] && strcmp(s, ssid) != 0) {
+            continue;               /* 不是这一槽 */
+        }
+        creds_del_slot(h, i);
+        ESP_LOGW(TAG, "已清除槽 %d 的凭据（'%s'）", i + 1, s);
+        if (!ssid || !ssid[0]) {
+            break;                  /* 没指定 SSID：只清第一个有内容的 */
+        }
+    }
+
+    /* last_ok 指向的那一槽如果被清了，就把它重置（避免开机反复试空槽）*/
+    uint8_t last = WIFI_SLOT_NONE;
+    if (nvs_get_u8(h, WIFI_NVS_LASTOK, &last) == ESP_OK && last < WIFI_SLOT_MAX) {
+        if (!creds_slot_used(h, last)) {
+            nvs_set_u8(h, WIFI_NVS_LASTOK, WIFI_SLOT_NONE);
+        }
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/**
+ * @brief 清掉**全部**槽位（用户明确要求"重置 WiFi"时才用）
+ *
+ * @note 仍然**不用** `nvs_erase_all` —— 那个连 `slot_cnt`/`last_ok`
+ *       都可能一起抹掉，留下"计数说有 5 槽、其实一个都没了"的脏状态。
+ *       这里逐槽删，然后显式把计数归零。
+ */
+static void creds_erase_all_slots(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    for (int i = 0; i < WIFI_SLOT_MAX; i++) {
+        creds_del_slot(h, i);
+    }
+    nvs_set_u8(h, WIFI_NVS_SLOTCNT, 0);
+    nvs_set_u8(h, WIFI_NVS_LASTOK, WIFI_SLOT_NONE);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/** @brief 记下"这次连上的是第几槽"（下回开机优先试它）*/
+static void creds_mark_last_ok(int slot)
+{
+    if (slot < 0 || slot >= WIFI_SLOT_MAX) {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(h, WIFI_NVS_LASTOK, (uint8_t)slot);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/** @brief 已保存的网络数量（界面显示用）*/
+static int creds_count(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < WIFI_SLOT_MAX; i++) {
+        if (creds_slot_used(h, i)) {
+            n++;
+        }
+    }
+    nvs_close(h);
+    return n;
 }
 
 /* ==================== SNTP ==================== */
@@ -386,6 +718,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
                 if (serr == ESP_OK) {
                     ESP_LOGI(TAG, "连接成功 -> 凭据已保存（下次开机自动重连）");
+                    /*
+                     * ★ v0.7.0：记下"这次连上的是哪一槽"。
+                     *   多槽位之后开机要**优先试上次成功的那个网络**，
+                     *   而不是死板按槽号 1→5 顺序一个个试。
+                     */
+                    {
+                        int fs = WIFI_SLOT_NONE;
+                        const int sl = creds_find(s_st.ssid, &fs);
+                        if (sl != WIFI_SLOT_NONE) {
+                            creds_mark_last_ok(sl);
+                        }
+                    }
                     lock();
                     s_st.auto_reconnect = true;
                     unlock();
@@ -467,7 +811,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             if (s_conn_used_saved && reason_is_auth(reason)) {
                 ESP_LOGW(TAG, "用已保存的密码连接失败（reason=%d）-> "
                               "清除保存的凭据，下次会重新询问密码", reason);
-                creds_erase();
+                /*
+                 * ★ v0.7.0：只清**这一个** SSID 的槽位。
+                 *   多槽位之后如果还用老的 nvs_erase_all，
+                 *   一次认证失败会把家里/公司/热点全删掉。
+                 */
+                creds_erase_ssid(s_st.ssid);
                 lock();
                 s_st.auto_reconnect = false;
                 s_st.ssid[0]        = '\0';
@@ -654,7 +1003,32 @@ static int hook_get_scan_result(wifi_ap_t *out, int max)
     return n;
 }
 
-static int hook_connect(const char *ssid, const char *password)
+/**
+ * @brief 发起一次连接
+ *
+ * @param ssid       目标 SSID
+ * @param password   密码；传 NULL/空串表示"用 NVS 里保存的那份"
+ * @param from_stored
+ *        ★ v0.7.0 新增：这次要用的密码是不是**来自 NVS 存储**。
+ *
+ *        它决定"认证失败时要不要自动清掉保存的凭据"：
+ *          - true  → 我们在拿一份**用户没重新输入过**的密码去试，
+ *                    失败说明这份密码很可能已过期 → 清掉，让界面重新问密码；
+ *          - false → 密码是用户**刚刚亲手输入**的 → 哪怕错了也不能删别人的东西，
+ *                    而且用户想改密码时正好就是走这条路。
+ *
+ *        ## 为什么必须显式传，不能像原来那样自己推断
+ *
+ *        原来只用局部变量 `from_saved` 推断 —— 它只在"密码为空、从 NVS 回填"时
+ *        才置 true。而**开机自动重连**是把密码当参数传进来的
+ *        （见 wifi_service_init 末尾：`hook_connect(ssid, pass)`），
+ *        于是 from_saved 恒为 false → 那条路径**永远不触发凭据自愈**。
+ *
+ *        实际后果（用户实测）：路由器改了密码 / 存了一份坏凭据之后，
+ *        开机自动重连会**无限次失败且不自愈** —— 界面一直"连接中"，
+ *        既不报错也不重新问密码，等于卡死没救。（交接文档 §10 #3 记的就是这个缺口。）
+ */
+static int hook_connect_ex(const char *ssid, const char *password, bool from_stored)
 {
     if (!ssid || !ssid[0]) {
         return -1;
@@ -696,6 +1070,11 @@ static int hook_connect(const char *ssid, const char *password)
     if (password && password[0]) {
         strncpy(eff_pass, password, sizeof(eff_pass) - 1);
         eff_pass[sizeof(eff_pass) - 1] = '\0';   /* ★ v0.6.1：strncpy 不保证补 0 */
+        /*
+         * ★ v0.7.0：密码虽然是参数传进来的，但它**可能来自存储**
+         *   （开机自动重连就是这么调的）。调用方知道来源，所以由它告诉我们。
+         */
+        from_saved = from_stored;
     } else {
         /* 只有 SSID 也匹配时才回填，避免把 A 的密码用到 B 上 */
         char saved_ssid[WIFI_SSID_MAX] = { 0 };
@@ -757,7 +1136,7 @@ static int hook_connect(const char *ssid, const char *password)
         if (known_secure) {
             ESP_LOGE(TAG, "'%s' 是加密网络但没有可用密码（保存的凭据已损坏/为空）"
                           " -> 不发起连接，清除这条坏记录，请重新输入密码", ssid);
-            creds_erase();
+            creds_erase_ssid(ssid);     /* ★ v0.7.0：只清这一条 */
             lock();
             s_st.state          = W_WIFI_FAILED;
             s_st.auto_reconnect = false;
@@ -970,6 +1349,17 @@ static int hook_connect(const char *ssid, const char *password)
 }
 
 /**
+ * @brief 界面/命令行调用的连接入口（密码是用户刚输入的，不是存储里的）
+ *
+ * @note 安装进 `wifi_hooks_t.connect`。走这条路时**不清凭据**
+ *       —— 见 hook_connect_ex 的 from_stored 说明。
+ */
+static int hook_connect(const char *ssid, const char *password)
+{
+    return hook_connect_ex(ssid, password, false);
+}
+
+/**
  * @brief 断开连接（**保留**密码）
  *
  * @note 密码留着，所以下次进 WiFi 页或下次开机还能自动重连。
@@ -1021,7 +1411,17 @@ static int hook_forget(void)
     s_user_disconnect = disconnect_event_expected();
     s_conn_used_saved = false;
     esp_wifi_disconnect();
-    creds_erase();
+
+    /*
+     * ★ v0.7.0：先记下当前 SSID，再删槽位。
+     *   多槽位之后 forget 只该"忘掉这一个网"，而不是把全部清光
+     *   （下面马上会把 s_st.ssid 清空，所以顺序不能反）。
+     */
+    char forget_ssid[WIFI_SSID_MAX] = { 0 };
+    lock();
+    snprintf(forget_ssid, sizeof(forget_ssid), "%s", s_st.ssid);
+    unlock();
+    creds_erase_ssid(forget_ssid);
     /* ★ v0.6.1 追加：用户明确要求"忘掉这个网" —— 暂存区里那份也不能回头又存进去 */
     pend_clear();
 
@@ -1040,6 +1440,26 @@ static int hook_forget(void)
 
     ESP_LOGI(TAG, "已断开并清除保存的密码");
     return 0;
+}
+
+/** @brief 取"已保存的第 idx 个网络"（v0.7.0 多槽位）*/
+static int hook_get_saved_ssid_at(int idx, char *ssid, int max)
+{
+    if (!ssid || max <= 0 || idx < 0) {
+        return -1;
+    }
+    ssid[0] = '\0';
+    char pass[WIFI_PASS_MAX] = { 0 };
+    if (creds_load_slot(idx, ssid, (size_t)max, pass, sizeof(pass)) != ESP_OK) {
+        return -1;
+    }
+    return 0;
+}
+
+/** @brief 已保存的网络数量 */
+static int hook_saved_count(void)
+{
+    return creds_count();
 }
 
 static void hook_get_status(wifi_status_t *out)
@@ -1135,6 +1555,8 @@ static const wifi_hooks_t s_hooks = {
     .forget           = hook_forget,
     .get_status       = hook_get_status,
     .get_saved_ssid   = hook_get_saved_ssid,
+    .get_saved_ssid_at = hook_get_saved_ssid_at,   /* ★ v0.7.0 多槽位 */
+    .saved_count      = hook_saved_count,          /* ★ v0.7.0 */
     .sync_time        = hook_sync_time,
 };
 
@@ -1182,8 +1604,14 @@ esp_err_t wifi_service_reset(void)
         s_started = false;
     }
 
-    /* 清掉保存的凭据，避免再自动重连到旧配置 */
-    creds_erase();
+    /*
+     * 清掉保存的凭据，避免再自动重连到旧配置。
+     *
+     * ★ v0.7.0：这里用"清全部槽位"而不是 `nvs_erase_all` ——
+     *   后者会把 slot_cnt/last_ok 也一起抹掉，留下"计数说有 5 槽、
+     *   其实一个都没了"的脏状态。逐槽删 + 显式归零更干净。
+     */
+    creds_erase_all_slots();
     pend_clear();       /* ★ v0.6.1 追加：暂存区一并清掉，别让重置后又被写回去 */
     lock();
     memset(&s_st, 0, sizeof(s_st));
@@ -1264,14 +1692,58 @@ esp_err_t wifi_service_init(void)
 
     ESP_LOGI(TAG, "WiFi 服务就绪");
 
-    /* ---------- 开机自动重连 ---------- */
+    /*
+     * ---------- 开机自动重连（★ v0.7.0：改成**默认关闭**，由设置项控制）----------
+     *
+     * ## 为什么默认关掉它
+     *
+     * 以前是"只要 NVS 里有凭据就一定自动连"。后果（用户实测并明确要求改）：
+     *   · 用户根本没打算联网，表却在后台一直连；
+     *   · 那个 AP 不在（比如热点关了）或凭据坏了时，状态**一直是"连接中"**，
+     *     既不报错也无法退出 —— 只能干等，用户体验很差；
+     *   · 还白白耗电（WiFi 常连是这块板最大的耗电项之一）。
+     *
+     * 现在联网变成**用户的动作**：进 WiFi 页点一下才连。
+     * 想要恢复旧行为：把设置项 `wifi_auto` 置 1
+     * （串口：`settings` 看，或用设置页/`nvs` 改；默认值见 settings.c 的 s_desc）。
+     *
+     * ## 为什么还要保留这段代码（而不是删掉）
+     *
+     * 因为"自动连"本身是有用的能力，只是不该**默认**开。
+     * 而且这条路径现在是**唯一**会用到 `from_stored=true` 的地方（见下）。
+     */
+    int32_t auto_conn = 0;
+    if (settings_get(SETTINGS_WIFI_AUTO, &auto_conn) != ESP_OK) {
+        auto_conn = 0;                  /* 读不到（设置服务没就绪）→ 按关闭处理 */
+    }
+    if (auto_conn == 0) {
+        ESP_LOGI(TAG, "开机自动连接 WiFi 已关闭（设置项 wifi_auto=0）"
+                      "，需要联网请进 WiFi 页手动连接");
+        return ESP_OK;
+    }
+
     char ssid[WIFI_SSID_MAX], pass[WIFI_PASS_MAX];
     if (creds_load(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK && ssid[0]) {
         ESP_LOGI(TAG, "发现已保存的网络 '%s'，自动重连", ssid);
         lock();
         s_st.auto_reconnect = true;
         unlock();
-        hook_connect(ssid, pass);
+        /*
+         * ★ v0.7.0：这里必须传 from_stored = **true**。
+         *
+         *   这份密码是从 NVS 读出来的、用户没有重新输入过 ——
+         *   如果它已经失效（路由器改过密码 / 存了一份坏凭据），
+         *   必须让"认证失败自动清凭据"这条自愈逻辑生效，
+         *   否则就会无限重连失败且永远不重新问密码（用户实测踩到过）。
+         *
+         *   ⚠️ 局限（已知，别再当新 bug 查）：自愈只对**认证类**失败
+         *      （reason 2/15/… 见 reason_is_auth）生效。如果 AP 根本不在
+         *      附近，驱动报的是 201（NO_AP_FOUND），那是"没信号"而不是
+         *      "密码错"，**故意不清凭据**（否则出趟门回来密码就没了）。
+         */
+        hook_connect_ex(ssid, pass, true);
+    } else {
+        ESP_LOGI(TAG, "没有已保存的网络，不自动连接");
     }
 
     return ESP_OK;

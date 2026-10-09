@@ -305,6 +305,9 @@ extern const watch_page_t watch_page_health;
 /** @brief 功能列表页：设置 / 时钟 / WiFi 连接 / 开发人员选项 */
 extern const watch_page_t watch_page_functions;
 
+/** @brief 工具页（v0.7.0）：计算器，以后挂日历/天气这类纯工具 */
+extern const watch_page_t watch_page_tools;
+
 /** @brief 获取所有内置页面的注册表（NULL 结尾） */
 const watch_page_t *const *watch_pages_all(void);
 
@@ -376,6 +379,13 @@ void watch_ui_set_setting_hooks(watch_setting_get_fn get_fn,
 #define W_SETTING_AUTO_SCREEN  "auto_screen"   /* 自动息屏秒数，0=常亮 */
 #define W_SETTING_STEP_GOAL    "step_goal"     /* 每日步数目标 */
 
+/* ---------- v0.7.0 新增：时区（只读，给日历页算本地日期用）----------
+ *
+ * 时区本来只在设备侧的 `SETTINGS_TIMEZONE` 里，界面层拿不到。
+ * 日历要"UTC epoch → 本地年月日"，所以把它按同一套"按名字寻址"的钩子暴露出来。
+ * 单位是 **15 分钟**（+8 区 = 32），和设备侧一致。 */
+#define W_SETTING_TZ           "tz"
+
 /* ---------- v0.5.0 新增：时钟服务要持久化的 5 项 ----------
  *
  * 时钟服务（watch_clock.c）跑在 watch_ui 里，**不能 include settings.h**
@@ -394,6 +404,25 @@ void watch_ui_set_setting_hooks(watch_setting_get_fn get_fn,
  * 由游戏宿主（watch_game.c）读写，游戏本体只提供键名
  * （见 w_game_t::best_key）。加新游戏就再加一个键名 + app 层一行映射。 */
 #define W_SETTING_DINO_BEST    "dino_best"     /* 小恐龙最高分 */
+
+/* ---------- v0.7.0 新增：2048 最高分 ----------
+ *
+ * 加一款游戏就再加一个键名 + app 层一行映射（见 watch_page_games.c 的文件头）。*/
+#define W_SETTING_2048_BEST    "best_2048"     /* 2048 最高分 */
+
+/* ---------- v0.7.0 新增：天气经纬度（整数微度，见 watch_page_weather_city.c）----------
+ *
+ * 单位 1e-5 度：上海 = 3123000 / 12147000。
+ * 为什么用整数：设置钩子签名是 `int`，而且 NVS 里整数没有 float 的精度问题。*/
+#define W_SETTING_WX_LAT       "wx_lat"        /* 纬度，1e-5 度 */
+#define W_SETTING_WX_LON       "wx_lon"        /* 经度，1e-5 度 */
+
+/* ---------- v0.7.0 新增：WiFi 开机自动连接 ----------
+ *
+ * 默认 0（关）。以前是"有凭据就一定自动连"，AP 不在时会一直卡在
+ * "连接中"，用户既没让它连也没法退出 → 改成由这个设置项控制。
+ * 界面在设置页（watch_page_settings.c），设备侧在 wifi_service_init() 读。 */
+#define W_SETTING_WIFI_AUTO    "wifi_auto"     /* 开机自动连 WiFi 0/1 */
 
 /** @brief 读设置项（钩子没接时返回 def） */
 int watch_ui_setting_get(const char *key, int def);
@@ -417,10 +446,38 @@ int watch_ui_setting_set(const char *key, int value);
  *     ├── 时钟      → watch_clock_open()      （标签栏：时间/秒表/倒计时/闹钟）
  *     ├── WiFi 连接 → watch_wifi_open()       （已有）
  *     └── 开发人员选项 → watch_developer_open_menu()（IMU录制/系统信息/蜂鸣器测试）
+ *
+ * ★ v0.7.0：轮播加了第 5 页「工具」，承载纯工具类功能：
+ *
+ *     工具
+ *     └── 计算器    → watch_calc_open()       （求值逻辑在 calc_engine.c，纯 C）
  * ================================================================== */
 
 /** @brief 打开"设置"子页 */
 void watch_settings_open(void);
+
+/** @brief 打开"计算器"子页（工具页进去） */
+void watch_calc_open(void);
+
+/** @brief 打开"日历"子页（工具页进去）—— LVGL 自带 lv_calendar，最便宜的一个 */
+void watch_calendar_open(void);
+
+/** @brief 打开"天气"子页（工具页进去）—— 数据经 w_platform_weather() 钩子来 */
+void watch_weather_open(void);
+
+/** @brief 打开"城市坐标"子页（天气页里再进去，二级） */
+void watch_weather_city_open(void);
+
+/* ---------- 计算器的自检接口（v0.7.0）----------
+ *
+ * 求值逻辑本身由 `calc_engine.c` 的测试向量覆盖（纯函数，34 条）。
+ * 下面两个是给自检驱动**界面**用的：按键怎么拼表达式、显示有没有更新，
+ * 这两件事只有真的按一遍才知道。
+ *
+ * @note 只给 PC 模拟器自检用；页面没打开时返回 NULL。
+ */
+lv_obj_t *watch_calc_debug_btnmatrix(void);
+const char *watch_calc_debug_expr_text(void);
 
 /** @brief 打开"游戏"列表子页（功能列表第 5 行进去） */
 void watch_games_open(void);

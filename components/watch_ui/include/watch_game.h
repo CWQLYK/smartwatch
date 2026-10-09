@@ -177,6 +177,15 @@ int w_game_debug_frames(void);
 const w_game_t *w_game_debug_game(void);
 
 /**
+ * @brief 当前画布对象（可能是 NULL）
+ *
+ * @note 给自检"注入已知状态后自己触发一次渲染"用 ——
+ *       比如 2048 要截一张"全是 1024/2048 大数字"的图，
+ *       光靠正常对局打不出那个局面（要滑几百步）。
+ */
+lv_obj_t *w_game_debug_canvas(void);
+
+/**
  * @brief 把画布位图整个填成指定索引（自检用：确认画布真的在写）
  * @return 实际写入的像素数
  */

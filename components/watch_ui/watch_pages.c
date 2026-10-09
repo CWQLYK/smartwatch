@@ -61,6 +61,7 @@
 #include "watch_clock.h"
 #include "watch_alert.h"
 #include "watch_game.h"
+#include "watch_toast.h"
 
 static const char *TAG = "WATCH_UI";
 
@@ -837,6 +838,18 @@ esp_err_t watch_ui_init(const watch_data_provider_t *provider,
      *    但先建提醒层能保证"刚打开游戏、闹钟恰好在这一刻响"时提醒层不被漏掉。
      */
     watch_game_init(s_scr);
+
+    /*
+     * 通用提示条（v0.7.0）挂 `lv_layer_top()`，**不属于**上面这组 screen 层。
+     *
+     * 为什么单独一层：toast 是"轻量反馈"，既不该占模态栈位（只有 4 层）、
+     * 也不该吃点击；挂 layer_top 还天然高于挂在 screen 上的模态栈，
+     * 不需要像提醒层那样每次 poll 抢 z-order。
+     *
+     * ⚠️ 它**必须**在 s_scr 建好之后初始化（lv_layer_top 要先有 display），
+     *    但和上面三层的相对顺序无关（不同父对象，不存在谁盖谁）。
+     */
+    watch_toast_init();
 
     watch_state_t st;
     s_provider->get_state(&st);
