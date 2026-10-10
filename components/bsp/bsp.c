@@ -30,6 +30,9 @@
 
 static const char *TAG = "BSP";
 
+/* 界面任务心跳（见 bsp.h） */
+volatile uint32_t g_bsp_lvgl_beat = 0;
+
 /* ==================== 内部状态 ==================== */
 static esp_lcd_panel_io_handle_t s_lcd_io      = NULL;
 static esp_lcd_panel_handle_t    s_lcd_panel   = NULL;
@@ -167,6 +170,10 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     esp_lcd_touch_handle_t tp = (esp_lcd_touch_handle_t)drv->user_data;
     uint16_t x = 0, y = 0;
     uint8_t  cnt = 0;
+
+    /* ★ 界面任务心跳：本回调每 10ms 被 LVGL 任务调一次（见 bsp.h 的说明）。
+     *   卡死哨兵靠它判断"界面任务是不是停住了"——读一个变量，不碰内核锁。 */
+    g_bsp_lvgl_beat++;
 
     /*
      * ★ v0.7.1 省电门控：息屏 + INT 为高（没人碰）→ 直接报"松开"，**不做 I2C 事务**。

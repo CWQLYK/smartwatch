@@ -455,7 +455,7 @@ static bool fetch_once(void)
      *   而天气服务是 v0.7.0 才加的，所以这个第 4 处一直没被踩到）。
      *   现已补进 `doc/version/README.md` 的"怎么加一个新版本"清单。
      */
-    esp_http_client_set_header(cli, "User-Agent", "SmartWatch/0.7.1");
+    esp_http_client_set_header(cli, "User-Agent", "SmartWatch/0.7.2");
 
     const esp_err_t err = esp_http_client_perform(cli);
     const int code = esp_http_client_get_status_code(cli);

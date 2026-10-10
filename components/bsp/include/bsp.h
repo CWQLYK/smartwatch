@@ -92,6 +92,17 @@ esp_err_t bsp_backlight_set(int percent);
 int bsp_backlight_get(void);
 
 /**
+ * @brief LVGL 任务心跳（v0.7.1 诊断用）：每次触摸读回调自增
+ *
+ * 为什么放在这里：`touch_read_cb` 由 LVGL 任务每 `LV_INDEV_DEF_READ_PERIOD`(10ms) 调一次，
+ * 是"界面任务还活着"最便宜、最不依赖内核的观测点（读一个 volatile 变量即可，
+ * **不需要拿内核锁** —— 卡死哨兵就是靠它判断系统是不是停住了）。
+ *
+ * ⚠️ 只在诊断里读，业务逻辑不要用它。
+ */
+extern volatile uint32_t g_bsp_lvgl_beat;
+
+/**
  * @brief 面板显示开关（ST7789 DISPON 0x29 / DISPOFF 0x28）—— v0.7.1 省电
  *
  * @param on true = 开显示输出；false = 关显示输出（面板不再扫描，省静态功耗）

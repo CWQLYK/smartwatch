@@ -31,6 +31,7 @@
 #include "watch_overlay.h"
 #include "motion.h"
 #include "imu_logger.h"
+#include "pwr_log.h"          /* ★ v0.7.1 复位黑盒 pwr_log_note_boot() */
 #include "buzzer.h"
 #include "power.h"
 #include "wifi_service.h"
@@ -47,7 +48,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.7.1"
+#define APP_VERSION_STR  "0.7.2"
 
 const char *app_version(void)
 {
@@ -695,6 +696,25 @@ esp_err_t app_start(void)
     if (imu_logger_init() != ESP_OK) {
         ESP_LOGW(TAG, "IMU 记录器不可用（存储挂载失败），录制功能将不可用");
     }
+
+    /*
+     * ★ 复位黑盒（v0.7.1）：把"这次为什么重启 + 当时的电池电压"记进 Flash。
+     *
+     * 放在这里是因为它要用 SPIFFS，而 SPIFFS 由上面的 imu_logger_init() 挂载。
+     * 为什么需要：**电池供电时没有串口**（USB 一插上就变成 USB 供电，故障往往不复现），
+     * 而"每隔几秒重启一次"这类问题恰恰只在电池下出现 —— 只能靠这份记录事后判断
+     * 是掉电复位（供电问题）还是崩溃/看门狗（软件问题）。用 `power log boot` 读。
+     */
+    pwr_log_note_boot();
+
+    /*
+     * ★ 卡死哨兵（v0.7.1）：实测出现过"静默硬死"——屏幕冻住、连串口控制台都没反应，
+     *   而且**不复位、无 panic、无 coredump**（事后取证手段全部失效）。
+     *   哨兵独立跑在 CPU 1 上、不依赖 esp_timer，盯着界面任务的心跳；
+     *   一旦停住就把现场写进 /spiffs/hang.txt（用 `power log hang` 读）。
+     *   详见 components/pwr_log/include/pwr_log.h。
+     */
+    pwr_log_hang_watch_start();
 
     /*
      * 放在 data_hub 之后：它算完步数要推给 data_hub。

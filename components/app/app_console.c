@@ -21,6 +21,7 @@
 #include "esp_console.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "driver/usb_serial_jtag.h"   /* ★ v0.7.1：usb_serial_jtag_is_connected()（无主机守卫用） */
 #include "esp_debug_helpers.h"    /* esp_backtrace_print_all_tasks：bt 命令（v0.6.1） */
 #include "bsp.h"
 #include "settings.h"
@@ -34,6 +35,7 @@
 #include "watch_pages.h"
 #include "wifi_service.h"
 #include "power.h"
+#include "pwr_log.h"
 
 static const char *TAG = "CONSOLE";
 
@@ -738,6 +740,81 @@ static int cmd_wifi(int argc, char **argv)
     return 1;
 }
 
+/**
+ * @brief power log <start|stop|status|dump [all]|erase> —— 功耗日志（v0.7.1 测量用）
+ *
+ * 为什么要它：插着 USB 时 VBUS 直接给整机供电 + 给电池充电，量不到手表自己的功耗；
+ * 不插 USB 又没有串口。所以让手表自己把「电池 mV + 墙上时间」录进 Flash，
+ * 拔线静置一段时间后插回来一条命令导出 → 用"电压下降速率"比较省电效果。
+ * 详见 components/pwr_log/include/pwr_log.h。
+ */
+static int cmd_power_log(int argc, char **argv)
+{
+    /* argv[0]="power", argv[1]="log", argv[2]=动作 */
+    const char *act = (argc > 2) ? argv[2] : "status";
+
+    if (strcmp(act, "start") == 0) {
+        const esp_err_t err = pwr_log_start();
+        if (err == ESP_OK) {
+            printf("已开始记录（每 %d 秒一条）。现在拔掉 USB，静置一段时间，"
+                   "插回来后打 power log dump\n", PWR_LOG_INTERVAL_S);
+        } else {
+            printf("开始失败：%s\n", esp_err_to_name(err));
+        }
+        return err == ESP_OK ? 0 : 1;
+    }
+
+    if (strcmp(act, "stop") == 0) {
+        pwr_log_stop();
+        printf("已停止记录（数据保留在 Flash 里，可 power log dump 读）\n");
+        return 0;
+    }
+
+    if (strcmp(act, "dump") == 0) {
+        const bool all = (argc > 3) && (strcmp(argv[3], "all") == 0);
+        pwr_log_dump(all);
+        return 0;
+    }
+
+    if (strcmp(act, "boot") == 0) {
+        /* 复位黑盒：电池供电时看不到串口，"为什么重启"只能靠它事后查 */
+        pwr_log_dump_boots();
+        return 0;
+    }
+
+    if (strcmp(act, "hang") == 0) {
+        /* 卡死现场：硬死机（无复位、无 coredump）只能靠哨兵事先写下来 */
+        pwr_log_dump_hang();
+        return 0;
+    }
+
+    if (strcmp(act, "erase") == 0) {
+        const esp_err_t err = pwr_log_erase();
+        if (err == ESP_OK) {
+            printf("日志已清空\n");
+        } else {
+            printf("清空失败：%s\n", esp_err_to_name(err));
+        }
+        return err == ESP_OK ? 0 : 1;
+    }
+
+    /* status（默认）*/
+    {
+        const int cnt = pwr_log_count();
+        printf("\n  功耗日志：%s，已有 %d 条",
+               pwr_log_running() ? "正在记录" : "未在记录", cnt);
+        if (cnt > 0) {
+            printf("（约 %d 分钟）", cnt * PWR_LOG_INTERVAL_S / 60);
+        }
+        /* ⚠️ 这里**不能**用 Unicode 箭头 →(2192)：watch_strings.h:326 明确禁用
+         *    （字库里没有，会显示成豆腐块，check_all_literals.py 也会直接报红）。
+         *    串口提示统一用 ASCII 的 -> ，和 "已翻页 -> [1]" 那种风格保持一致。 */
+        printf("\n  用法：power log start -> 拔线静置 -> 插回线 -> power log dump [all]\n");
+        printf("        每次测量前建议先 power log erase；比较时要在相近的起始电压下比\n\n");
+    }
+    return 0;
+}
+
 static int cmd_power(int argc, char **argv)
 {
     const char *sub = (argc > 1) ? argv[1] : "status";
@@ -758,7 +835,10 @@ static int cmd_power(int argc, char **argv)
         printf("\n");
         return 0;
     }
-    printf("可用: power on|off|status\n");
+    if (strcmp(sub, "log") == 0) {
+        return cmd_power_log(argc, argv);
+    }
+    printf("可用: power on|off|status|log <start|stop|status|dump [all]|erase>\n");
     return 1;
 }
 
@@ -1044,7 +1124,7 @@ static void register_commands(void)
         { .command = "next",           .help = "翻到下一页（调试用）", .func = cmd_next },
         { .command = "pages",          .help = "当前页布局/滚动情况", .func = cmd_pages },
         { .command = "wifi",           .help = "WiFi: wifi on|status|scan|connect <SSID> [密码]|disconnect|forget|reset|sync", .func = cmd_wifi },
-        { .command = "power",          .help = "屏幕: power on|off|status", .func = cmd_power },
+        { .command = "power",          .help = "屏幕: power on|off|status|log <start|stop|status|dump [all]|erase>", .func = cmd_power },
         { .command = "rec",            .help = "IMU 录制: rec start|stop|status|list|get <文件>|erase", .func = cmd_rec },
         { .command = "imu_raw",        .help = "打印 IMU 原始码值: imu_raw [次数]", .func = cmd_imu_raw },
         { .command = "motion",         .help = "计步状态（步数/步频/信号强度）", .func = cmd_motion },
@@ -1068,6 +1148,102 @@ static void register_commands(void)
             ESP_LOGW(TAG, "注册命令 '%s' 失败: %s", cmds[i].command,
                      esp_err_to_name(err));
         }
+    }
+}
+
+/* ==================================================================
+ * ★ v0.7.1 修：没有 USB 主机时，REPL 任务会把 CPU 转满、饿死空闲任务
+ *
+ * ## 现象（电池供电必现，插着 USB 反而看不到）
+ *
+ *   电池供电 → 每 7.5 秒重启一次；屏幕正常、界面不卡（因为 taskLVGL 优先级更高）；
+ *   复位黑盒里连着一串 `TASK_WDT`（任务看门狗），不是掉电复位。
+ *
+ * ## 根因（逐层查到 IDF 源码）
+ *
+ *   1. 没有 USB 主机时，IDF 的 VFS 读**立即返回 -1**，不阻塞：
+ *        components/esp_driver_usb_serial_jtag/src/usb_serial_jtag_vfs.c
+ *          static ssize_t usb_serial_jtag_read(...) {
+ *              if (!usb_serial_jtag_is_connected()) {
+ *                  // TODO: IDF-14303
+ *                  return -1;
+ *              }
+ *   2. `linenoise` 拿到错误就当"这一轮没读到"，REPL 任务**不带任何延时**地重试 →
+ *      **死循环**（IDF 已知问题，本工程无法改 IDF）。
+ *   3. REPL 任务的配置是 **优先级 2 + 默认绑核 CPU0**（见下面 repl_cfg），
+ *      而 `IDLE0` 是**优先级 0、同一个核** → 被彻底饿死。
+ *   4. 空闲任务负责喂任务看门狗 → 5 秒没喂 → `Task watchdog got triggered` → panic 重启。
+ *      （重启约 2.5 秒，所以实测间隔 7.5 秒 = 5 + 2.5）
+ *
+ * ## 修法
+ *
+ *   用一个 1 秒的守卫（跑在 esp_timer 任务里，优先级 22，不会被饿死）：
+ *   **没主机就把 REPL 任务挂起，主机回来再唤醒**。
+ *   - 挂起窗口最多 1 秒 → 远小于 5 秒看门狗 → 不再重启；
+ *   - 插上 USB 后 1 秒内自动恢复，命令行体验完全不变（linenoise/历史都保留）；
+ *   - 不用"把 IDLE 从看门狗里摘掉"这种掩盖法：那样 CPU 仍会被转满，对电池是灾难。
+ *
+ * ⚠️ 不这么修的话，**电池供电时手表根本不能长时间工作**（而且白烧一个核的电）。
+ * ================================================================== */
+#define CONSOLE_REPL_TASK_NAME   "console_repl"   /* IDF 建任务时用的名字 */
+#define CONSOLE_GUARD_PERIOD_MS  1000
+
+static esp_timer_handle_t s_guard_timer = NULL;
+static bool               s_repl_suspended = false;
+
+static void console_host_guard_cb(void *arg)
+{
+    (void)arg;
+
+    TaskHandle_t h = xTaskGetHandle(CONSOLE_REPL_TASK_NAME);
+    if (!h) {
+        return;                     /* REPL 任务还没建起来 */
+    }
+
+    const bool host = usb_serial_jtag_is_connected();
+    if (!host && !s_repl_suspended) {
+        /*
+         * ★★ 必须先拿住 stdout 的流锁，再挂起 REPL 任务（实测踩过的死锁）：
+         *
+         *   挂起是"随时生效"的 —— 如果正好把它停在**打印提示符**中间，它就
+         *   **攥着 stdout 的流锁睡着不放了**；于是**任何打日志的任务都会永久阻塞**
+         *   （第一个撞上的就是 esp_timer，优先级 22 —— 实测复位黑盒/卡死报告里
+         *   能看到 console_repl 的优先级被继承成 22，就是 esp_timer 在等它）。
+         *   再往下：依赖 esp_timer 的东西全停、界面任务打一次日志也卡住 →
+         *   **整机静默硬死**（不复位、无 coredump、连串口都没反应）。
+         *
+         *   用**非阻塞** `ftrylockfile`：拿不到说明它正在打印，那就这一拍先不挂，
+         *   下一秒再来 —— 反正它空转最多再持续 1 秒，远小于 5 秒看门狗。
+         */
+        if (ftrylockfile(stdout) == 0) {
+            vTaskSuspend(h);
+            funlockfile(stdout);
+            s_repl_suspended = true;
+            /* ⚠️ 这句日志本身要打 stdout —— 所以放在 funlockfile 之后，别在持锁时打 */
+            ESP_LOGW(TAG, "没有 USB 主机：已把 %s 任务挂起（否则它会空转，占住 CPU 不放）",
+                     CONSOLE_REPL_TASK_NAME);
+        }
+    } else if (host && s_repl_suspended) {
+        vTaskResume(h);
+        s_repl_suspended = false;
+        ESP_LOGI(TAG, "USB 主机已连接：恢复 %s 任务", CONSOLE_REPL_TASK_NAME);
+    }
+}
+
+/** @brief 启动"无主机守卫"（早于 REPL 创建，保证死循环一起就被按住） */
+static void console_host_guard_start(void)
+{
+    const esp_timer_create_args_t ta = {
+        .callback = console_host_guard_cb,
+        .name     = "con_guard",
+    };
+    if (esp_timer_create(&ta, &s_guard_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "守卫定时器创建失败（没有 USB 主机时可能被看门超时重启）");
+        return;
+    }
+    if (esp_timer_start_periodic(s_guard_timer,
+                                 (uint64_t)CONSOLE_GUARD_PERIOD_MS * 1000) != ESP_OK) {
+        ESP_LOGW(TAG, "守卫定时器启动失败");
     }
 }
 
@@ -1105,6 +1281,9 @@ esp_err_t app_console_start(void)
         ESP_LOGE(TAG, "创建串口 REPL 失败: %s", esp_err_to_name(err));
         return err;
     }
+
+    /* ★ 守卫要在 REPL 跑起来**之前**启动：没主机时它会立刻死循环，得马上按住 */
+    console_host_guard_start();
 
     register_commands();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_register_help_command());

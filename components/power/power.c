@@ -479,6 +479,14 @@ void power_dump(void)
              s_refr_pending ? "（有一次待补做）" : "",
              (unsigned)s_poll_ms,
              s_screen_on ? "开" : "关(DISPOFF)");
+    /* ★ 电源自锁：电池供电的命门（SYS_EN=GPIO41，见 board.h）。
+     *   拉高并回读为高 = 拔掉 USB 也能活着；为低 = 一拔线就断电。 */
+    {
+        const int lv = board_power_hold_level();
+        ESP_LOGI(TAG, "  电源自锁：SYS_EN(GPIO%d)=%s", BOARD_SYS_EN_GPIO,
+                 lv == 1 ? "高 ✓（电池供电正常）"
+                         : (lv == 0 ? "低 ✗（拔掉 USB 会断电！）" : "未配置"));
+    }
     ESP_LOGI(TAG, "  说明：息屏不冻结 lv_timer_handler（闹钟/倒计时仍会响并自动亮屏）；"
                   "刷新是放慢到 %dms 而非暂停（暂停会让 LVGL 任务睡 500ms，见 refr_apply）；"
                   "CPU 频率与 light sleep 属第二档，未做",
