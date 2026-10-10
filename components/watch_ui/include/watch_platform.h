@@ -283,7 +283,10 @@ const w_time_hooks_t *w_platform_time(void);
 /**
  * @brief 屏幕开关钩子
  *
- * @note "息屏"目前只关背光，CPU 和 IMU 照跑（用户要求先不做低功耗）。
+ * @note v0.7.1 起"息屏"不再只是关背光：= 关背光 + 面板 DISPOFF（停显示输出）
+ *       + LVGL 刷新放慢到 100ms + 电源轮询放慢到 200ms；触摸 I2C 在息屏空闲时
+ *       会被 INT 门控跳过。**CPU 与 IMU 照跑**（CPU 降频 / light sleep 属第二档，未做）。
+ *       详见 `doc/智能手表-低功耗实施文档.md`。
  *       界面层需要能**临时禁止息屏**（录制 IMU 时）和**主动亮屏**。
  */
 typedef struct {

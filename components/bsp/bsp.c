@@ -132,6 +132,19 @@ static esp_err_t lcd_init(void)
     return ESP_OK;
 }
 
+/**
+ * @brief 面板显示开关（v0.7.1 省电）—— 说明见 bsp.h
+ *
+ * @note 刻意**不加 delay**：它要能被 `power.c` 的 esp_timer 回调安全调用。
+ *       面板睡眠（SLPIN/SLPOUT）是更深的路线，但 IDF 的 ST7789 驱动内部
+ *       在 `esp_lcd_panel_disp_sleep()` 里无条件 `vTaskDelay(100)`，本版不用。
+ */
+esp_err_t bsp_lcd_display(bool on)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_panel, ESP_ERR_INVALID_STATE, TAG, "LCD 未初始化");
+    return esp_lcd_panel_disp_on_off(s_lcd_panel, on);
+}
+
 /* ==================== 触摸 ==================== */
 /**
  * @brief 触摸读取回调（LVGL 每次采样都会调）
@@ -140,7 +153,8 @@ static esp_err_t lcd_init(void)
  *   每次检测到按下就上报一次"用户正在操作"。
  *
  * 为什么必须在这里上报，而不是让电源模块自己轮询触摸中断脚：
- *   - LVGL 每 `LV_INDEV_DEF_READ_PERIOD`(5ms) 调一次本函数，**一次都不漏**
+ *   - LVGL 每 `LV_INDEV_DEF_READ_PERIOD`(**10ms**，见 sdkconfig) 调一次本函数，**一次都不漏**
+ *     （本注释曾写 5ms，与 sdkconfig 不符，v0.7.1 改正）
  *   - 而电源模块轮询是 50ms 一次，快速点击很容易被漏掉；
  *     一旦漏掉，息屏计时器就以为没人操作，用户正在点着屏幕时突然息屏
  *     （实测用户遇到的就是这个）
@@ -153,6 +167,31 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     esp_lcd_touch_handle_t tp = (esp_lcd_touch_handle_t)drv->user_data;
     uint16_t x = 0, y = 0;
     uint8_t  cnt = 0;
+
+    /*
+     * ★ v0.7.1 省电门控：息屏 + INT 为高（没人碰）→ 直接报"松开"，**不做 I2C 事务**。
+     *
+     * 为什么需要：LVGL 每 10ms 调一次本函数，而 `esp_lcd_touch_read_data()` 是一次
+     * 真实的 I2C 事务 —— 息屏时也照做 100 次/秒，纯浪费（息屏时本来就没人看屏幕）。
+     *
+     * 为什么安全：
+     *   1. CST816T 是**独立器件**（挂在 I2C 0x15），不受 LCD 面板 DISPOFF 影响；
+     *   2. 它的 INT 引脚（GPIO14，低有效）在手指按下时拉低 —— 本项目**已经在依赖
+     *      它**（power.c 的 touch_pressed() 就是读这个脚）；
+     *   3. 读一个 GPIO 是寄存器级操作，比一次 I2C 事务便宜几个数量级；
+     *   4. **亮屏时这道门不生效** → 触摸手感逐字节不变；
+     *   5. 有人碰时（INT 低）照旧走完整流程 → `w_screen_notify_activity()` → 亮屏
+     *      + 吞掉那一下。**唤醒必须仍然从这里进**（见 power.c 的铁律 #3），
+     *      所以这道门只拦"没人碰"，绝不会把唤醒挡掉。
+     *
+     * 副作用（实机确认过即可）：若某块板的 CST816T 空闲时 INT 不是稳定高电平，
+     * 只会退化成"多做几次 I2C 读"（省电收益变小），**不会误触** ——
+     * 因为坐标要真的按下才有效。
+     */
+    if (!w_screen_is_on() && gpio_get_level(BOARD_TOUCH_GPIO_INT) != 0) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
 
     esp_lcd_touch_read_data(tp);
     const bool pressed = esp_lcd_touch_get_coordinates(tp, &x, &y, NULL, &cnt, 1);

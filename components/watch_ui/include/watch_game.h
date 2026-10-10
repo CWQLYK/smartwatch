@@ -170,6 +170,15 @@ int w_game_debug_state(void);
 /** @brief 状态名的中文（日志/自检输出用） */
 const char *w_game_debug_state_name(void);
 
+/**
+ * @brief 当前帧定时器周期（ms）—— v0.7.1 省电断言用
+ *
+ * @note 不在游戏中时应当是 `GAME_FRAME_IDLE_MS`(300)，游戏中是 `GAME_FRAME_MS`(33)：
+ *       开始/暂停/结算面板上的按钮都是事件驱动的，没必要 30Hz 空转。
+ *       没有已建定时器时返回 0。
+ */
+uint32_t w_game_debug_frame_period(void);
+
 /** @brief 已经推进过多少帧（自检用来确认定时器/手动推帧真的在跑） */
 int w_game_debug_frames(void);
 

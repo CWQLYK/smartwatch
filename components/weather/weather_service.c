@@ -447,8 +447,15 @@ static bool fetch_once(void)
         ESP_LOGW(TAG, "http client 初始化失败");
         return false;
     }
-    /* 显式 UA：参考工程没设，出了问题不好排查 */
-    esp_http_client_set_header(cli, "User-Agent", "SmartWatch/0.7.0");
+    /*
+     * 显式 UA：参考工程没设，出了问题不好排查。
+     *
+     * ★ 注意：这也是**版本号**的一处（服务器端日志里能看到是哪版固件在抓）。
+     *   v0.7.1 才发现它一直没跟着版本走（项目文档原先只列了三处，
+     *   而天气服务是 v0.7.0 才加的，所以这个第 4 处一直没被踩到）。
+     *   现已补进 `doc/version/README.md` 的"怎么加一个新版本"清单。
+     */
+    esp_http_client_set_header(cli, "User-Agent", "SmartWatch/0.7.1");
 
     const esp_err_t err = esp_http_client_perform(cli);
     const int code = esp_http_client_get_status_code(cli);

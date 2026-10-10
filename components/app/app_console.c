@@ -744,12 +744,12 @@ static int cmd_power(int argc, char **argv)
 
     if (strcmp(sub, "off") == 0) {
         power_screen_off();
-        printf("已息屏（只关背光，CPU 照跑）\n");
+        printf("已息屏（背光关 + 面板 DISPOFF + 刷新放慢 + 轮询放慢；详见 power status）\n");
         return 0;
     }
     if (strcmp(sub, "on") == 0) {
         power_screen_on();
-        printf("已亮屏\n");
+        printf("已亮屏（面板 DISPON + 刷新恢复 + 整屏重画）\n");
         return 0;
     }
     if (strcmp(sub, "status") == 0) {

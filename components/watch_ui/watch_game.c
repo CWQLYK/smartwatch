@@ -41,6 +41,19 @@ static const char *TAG = "GAME";
  * 实机嫌不够跟手可以往 25ms（40FPS）调 —— 脏区机制已经留了余量。 */
 #define GAME_FRAME_MS     33
 
+/** @brief **非游戏中**时的帧定时器周期（v0.7.1 省电）。
+ *
+ * 为什么可以放这么慢：开始/暂停/结算面板上的按钮都是**事件驱动**的
+ * （点击走 LVGL 的 CLICKED，不依赖帧定时器），帧定时器在那些状态下
+ * 只是在回调里做两次 `lv_tick_get()` 就返回。
+ * 原来固定 33ms → 暂停面板上每秒白醒 30 次；放到 300ms 后只剩 3~4 次。
+ *
+ * ⚠️ 恢复游戏时必须在**一帧内**把周期改回来，否则恐龙会变成"每秒走 3 步"。
+ *    本文件的做法是在 frame_timer_cb 里按当前状态自适应（见 frame_timer_retime）。
+ *    安全性由 `GAME_DT_MAX_MS(80)` 兜底：从慢周期切回快周期时，
+ *    第一帧的 dt 会是 300ms，被夹成 80ms，不会出现"障碍物瞬移"。 */
+#define GAME_FRAME_IDLE_MS 300
+
 /** @brief 单帧最大 dt。
  *
  * ⚠️ 必须有上限：息屏、切页、系统卡一下，dt 可能是几百毫秒，
@@ -72,6 +85,7 @@ static lv_obj_t   *s_primary   = NULL;   /* 面板上的主按钮（开始/继�
 static lv_obj_t   *s_score_lb  = NULL;
 static lv_obj_t   *s_pause_btn = NULL;
 static lv_timer_t *s_timer     = NULL;
+static uint32_t    s_frame_period = 0;   /* 当前帧定时器周期（v0.7.1 自适应，靠它避免重复设置） */
 
 static const w_game_t *s_game  = NULL;
 static game_state_t    s_state = GS_NONE;
@@ -462,9 +476,39 @@ static void auto_pause_check(void)
     }
 }
 
+/**
+ * @brief 按当前状态自适应帧定时器周期（v0.7.1 省电）
+ *
+ * 只有 `GS_PLAY` 需要 33ms；开始/暂停/结算面板上是事件驱动的，300ms 足够。
+ * 照 `watch_clock.c` 那套"自己记周期 + lv_timer_set_period"的写法
+ * （本 LVGL 只有 set_period，没有 get_period，所以要自己记）。
+ */
+static void frame_timer_retime(void)
+{
+    if (!s_timer) {
+        return;
+    }
+    const uint32_t want = (s_state == GS_PLAY) ? GAME_FRAME_MS : GAME_FRAME_IDLE_MS;
+    if (s_frame_period == want) {
+        return;
+    }
+    lv_timer_set_period(s_timer, want);
+    s_frame_period = want;
+}
+
 static void frame_timer_cb(lv_timer_t *t)
 {
     (void)t;
+
+    /*
+     * 周期自适应：**放在"自检手动推帧"的早退之前**。
+     * 否则自检里（s_debug_hold_timer=true）永远走不到这一句，
+     * "暂停面板降到 300ms" 这个行为就没有断言能锁住。
+     */
+    if (s_state != GS_NONE) {
+        frame_timer_retime();
+    }
+
     if (s_debug_hold_timer || s_state == GS_NONE) {
         return;
     }
@@ -575,6 +619,7 @@ int w_game_open(const w_game_t *g)
 
     s_last_tick = lv_tick_get();
     s_timer = lv_timer_create(frame_timer_cb, GAME_FRAME_MS, NULL);
+    s_frame_period = GAME_FRAME_MS;   /* 与创建周期保持一致，供 frame_timer_retime 比较 */
 
     /*
      * ★ 玩游戏期间不许自动息屏。
@@ -599,6 +644,7 @@ void w_game_close(void)
     if (s_timer) {
         lv_timer_del(s_timer);
         s_timer = NULL;
+        s_frame_period = 0;      /* 下次开局重新按创建周期起算 */
     }
     w_screen_hold_awake(false);
 
@@ -684,6 +730,17 @@ void w_game_debug_click(int x, int y)
 int w_game_debug_state(void)
 {
     return (int)s_state;
+}
+
+/**
+ * @brief 当前帧定时器周期（ms）—— v0.7.1 省电断言用
+ *
+ * @note 不在游戏中时应当是 `GAME_FRAME_IDLE_MS`(300)，游戏中是 `GAME_FRAME_MS`(33)。
+ *       没有已建定时器时返回 0。
+ */
+uint32_t w_game_debug_frame_period(void)
+{
+    return s_timer ? s_frame_period : 0;
 }
 
 const char *w_game_debug_state_name(void)

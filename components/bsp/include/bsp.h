@@ -92,6 +92,24 @@ esp_err_t bsp_backlight_set(int percent);
 int bsp_backlight_get(void);
 
 /**
+ * @brief 面板显示开关（ST7789 DISPON 0x29 / DISPOFF 0x28）—— v0.7.1 省电
+ *
+ * @param on true = 开显示输出；false = 关显示输出（面板不再扫描，省静态功耗）
+ *
+ * @note **非阻塞**：只发一条命令（`esp_lcd_panel_io_tx_param`），没有 delay，
+ *       所以**可以在任意任务/定时器回调里调用**（包括 `power.c` 的 esp_timer 回调）。
+ *
+ * @note 它**只管面板显示输出**，不碰背光、不碰 LVGL 刷新 ——
+ *       那两件事由 `power.c` 的 `power_screen_on/off()` 负责编排。
+ *
+ * @note 与"面板睡眠"（SLPIN/SLPOUT）不是一回事：那个更深，但 IDF 的 ST7789 驱动
+ *       在 `esp_lcd_panel_disp_sleep()` 内部**无条件 vTaskDelay(100ms)**，
+ *       谁调谁阻塞，**禁止**从 esp_timer 回调里调
+ *       （见 `doc/智能手表-低功耗实施文档.md` §3.2 与 §四.5）。
+ */
+esp_err_t bsp_lcd_display(bool on);
+
+/**
  * @brief 获取 LVGL 锁（操作 UI 前必须调用）
  * @param timeout_ms 超时，-1(UINT32_MAX) 表示永久等待，0 表示不等待
  */
