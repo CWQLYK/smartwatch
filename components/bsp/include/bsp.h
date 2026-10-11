@@ -121,6 +121,27 @@ extern volatile uint32_t g_bsp_lvgl_beat;
 esp_err_t bsp_lcd_display(bool on);
 
 /**
+ * @brief 面板睡眠开关（ST7789 `SLPIN 0x10` / `SLPOUT 0x11`）—— v0.7.2「1.5 档」省电
+ *
+ * @param sleep true = 进睡眠（SLPIN，把面板内部振荡器/charge pump 也停掉）；
+ *              false = 唤醒（SLPOUT）
+ *
+ * @note ⚠️ **会阻塞约 100ms**：IDF 的 ST7789 驱动对 SLPIN/SLPOUT **都**无条件
+ *       `vTaskDelay(pdMS_TO_TICKS(100))`（`esp_lcd_panel_st7789.c:331`，已核源码）
+ *       ⇒ **只能在任务上下文调用，绝不能从 esp_timer 回调里调**
+ *       （息屏的触发点 `power.c` 的 `poll_cb` 就在 esp_timer 任务里 → 所以
+ *        SLPIN/SLPOUT 交给 `power.c` 里的供电状态机任务 `pwr_sm` 执行）。
+ *
+ * @note 时序：**SLPOUT 之后才能发后续命令**（面板上电初始化本身也是先 SLPOUT 再配置，
+ *       `esp_lcd_panel_st7789.c:187`）⇒ 唤醒顺序固定为
+ *       `bsp_lcd_sleep(false)` → `bsp_lcd_display(true)` → **整屏重画** → 开背光。
+ *
+ * @note ⚠️ 面板睡眠期间 **GRAM 写入无效、内容不可信** ⇒ 唤醒后必须整屏重画，
+ *       而且**要在重画完成之后才开背光**，否则用户会看到"黑屏/白闪一下才回画面"。
+ */
+esp_err_t bsp_lcd_sleep(bool sleep);
+
+/**
  * @brief 获取 LVGL 锁（操作 UI 前必须调用）
  * @param timeout_ms 超时，-1(UINT32_MAX) 表示永久等待，0 表示不等待
  */

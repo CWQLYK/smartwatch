@@ -38,6 +38,8 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"   /* v0.7.2：面板深睡状态机任务 */
+#include "freertos/task.h"        /* xTaskCreatePinnedToCore / ulTaskNotifyTake / vTaskDelay */
 #include "bsp.h"
 #include "board.h"
 #include "settings.h"
@@ -223,6 +225,117 @@ static void poll_retime(bool screen_off)
     s_poll_ms = want;
 }
 
+/* ==================== v0.7.2「1.5 档」：面板深浅睡状态机 ==================== */
+
+/*
+ * ## 为什么要单独一个任务
+ *
+ * `bsp_lcd_sleep()`（SLPIN/SLPOUT）**内部无条件阻塞约 100ms**（IDF 驱动行为，已核源码）。
+ * 而"何时息屏/亮屏"是由 `poll_cb`（**esp_timer 任务**）和触摸回调（LVGL 任务）触发的 ——
+ * esp_timer 回调里**绝对不能阻塞 100ms**（会把 esp_timer 任务占住，连带看门狗、电源轮询一起拖）。
+ *
+ * ⇒ 所以：**触发方只置"期望状态"（非阻塞）**，真正的 SLPIN/SLPOUT 由一个独立小任务 `pwr_sm` 执行。
+ *
+ * ## 唤醒顺序（不能变）
+ *
+ *   SLPOUT（阻塞 ~100ms）→ DISPON → **整屏重画（同步）** → 开背光
+ *
+ * 关键在最后两步：
+ *   - **面板睡眠期间 GRAM 写入无效、内容不可信** ⇒ 醒来必须整屏重画；
+ *   - **必须重画完再开背光** ⇒ 否则用户会看到"黑屏/白闪一下就回画面"。
+ *   所以用 `lv_refr_now()` **同步**重画（异步 invalidate 会让背光先亮、画面后到）。
+ *   重画前先 `invalidate_all()`：LVGL 并不知道面板被清空了，不强制失效就什么都不会重画。
+ */
+typedef enum {
+    WANT_AWAKE = 0,     /* 期望：面板醒着（浅睡/正常显示） */
+    WANT_DEEP  = 1,     /* 期望：面板深睡（SLPIN） */
+} panel_want_t;
+
+static volatile panel_want_t s_want    = WANT_AWAKE;
+static bool                  s_act_deep = false;   /* 面板当前是否已 SLPIN */
+static bool                  s_deep_enabled = true;/* 运行时可关（power deepsleep off） */
+static TaskHandle_t          s_sm_task = NULL;
+static volatile uint32_t     s_last_wake_ms = 0;   /* 最近一次"唤醒序列"耗时（客观验证那 100ms） */
+
+/** @brief 目标状态：期望深睡 **且** 功能没被关掉 */
+static inline bool sm_want_deep(void)
+{
+    return (s_want == WANT_DEEP) && s_deep_enabled;
+}
+
+/** @brief 请求状态机去处理（非阻塞，可在任意上下文调用） */
+static void sm_request(panel_want_t w)
+{
+    s_want = w;
+    if (s_sm_task) {
+        xTaskNotifyGive(s_sm_task);
+    }
+}
+
+static void pwr_sm_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        /* 每完成一步都重读目标 ⇒ "意愿合并"：途中被反向请求就直接转到最终状态，
+         * 不做无谓的 SLPIN→SLPOUT（否则一次误触就要多花 200ms）。 */
+        while (sm_want_deep() != s_act_deep) {
+            const int64_t t0 = now_us();
+
+            if (sm_want_deep()) {
+                /* ---- 入睡：DISPOFF 已由 power_screen_off() 做过（那一步非阻塞）---- */
+                const esp_err_t e = bsp_lcd_sleep(true);      /* 阻塞 ~100ms */
+                s_act_deep = true;
+                ESP_LOGI(TAG, "面板深睡 SLPIN%s（耗时 %d ms）",
+                         e == ESP_OK ? "" : " 失败", (int)((now_us() - t0) / 1000));
+            } else {
+                /* ---- 唤醒：SLPOUT → DISPON → 同步整屏重画 → 背光 ----
+                 * 注意：刷新速率（10ms）已在 power_screen_on() 里恢复过了（那步非阻塞）。 */
+                bsp_lcd_sleep(false);                         /* SLPOUT，阻塞 ~100ms */
+                bsp_lcd_display(true);                        /* DISPON */
+
+                /* 同步整屏重画：拿不到锁就重试几次（最多约 100ms），
+                 * 实在拿不到也不能把背光一直关着 —— 那样用户以为死机了。 */
+                bool drawn = false;
+                for (int i = 0; i < 5 && !drawn; i++) {
+                    if (bsp_display_lock(0)) {
+                        invalidate_all();                     /* LVGL 不知道面板被清空了 */
+                        lv_refr_now(bsp_display_get());        /* ★ 同步重画 */
+                        bsp_display_unlock();
+                        drawn = true;
+                    } else {
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+                }
+
+                backlight(true);
+                s_act_deep = false;
+                s_last_wake_ms = (uint32_t)((now_us() - t0) / 1000);
+                ESP_LOGI(TAG, "面板唤醒 SLPOUT+重画（耗时 %u ms%s）",
+                         (unsigned)s_last_wake_ms, drawn ? "" : "，没拿到 LVGL 锁已先开背光");
+            }
+        }
+    }
+}
+
+/** @brief 运行时开关（串口 `power deepsleep on|off`） */
+void power_deepsleep_set(bool on)
+{
+    if (s_deep_enabled == on) {
+        return;
+    }
+    s_deep_enabled = on;
+    ESP_LOGI(TAG, "面板深睡：%s", on ? "开" : "关（退回第一档：只 DISPOFF）");
+    sm_request(s_want);            /* 立刻按新设置对齐面板状态（关掉时会把面板唤醒） */
+}
+
+bool power_deepsleep_get(void)
+{
+    return s_deep_enabled;
+}
+
 void power_screen_on(void)
 {
     s_last_active = now_us();
@@ -230,9 +343,12 @@ void power_screen_on(void)
         return;
     }
 
-    /* ★ 顺序很重要：先让面板能显示 → 再恢复刷新速率并整屏重画 → 最后开背光 */
-    bsp_lcd_display(true);
-
+    /*
+     * ★ 本函数**只做非阻塞部分**：让"屏幕逻辑上已经亮"立刻成立
+     *   （屏蔽第一次触摸、活动计时都依赖它），
+     *   真正的面板动作（SLPOUT+DISPON+重画+背光）交给 `pwr_sm` 做
+     *   —— 因为它要阻塞约 100ms，而本函数可能被 LVGL 任务（触摸唤醒）调用。
+     */
     if (bsp_display_lock(0)) {
         lv_disp_t *disp = bsp_display_get();
         lv_timer_t *t   = disp ? _lv_disp_get_refr_timer(disp) : NULL;
@@ -241,21 +357,20 @@ void power_screen_on(void)
         }
         s_refr_slow    = false;
         s_refr_pending = false;
-        invalidate_all();
         bsp_display_unlock();
     } else {
-        /* 拿不到锁：记下期望状态，poll_cb 下一拍补做（重画也留在那时一起做） */
+        /* 拿不到锁：记下期望状态，poll_cb 下一拍补做 */
         s_refr_slow    = false;
         s_refr_pending = true;
     }
-
-    backlight(true);
     poll_retime(false);
 
     s_screen_on = true;
     s_wake_at   = now_us();     /* 进入"吃掉第一下"的屏蔽期 */
-    ESP_LOGI(TAG, "亮屏（面板 DISPON + 刷新恢复 %dms + 整屏重画）",
-             (int)LV_DISP_DEF_REFR_PERIOD);
+
+    /* 面板动作（含那 100ms）交给状态机 */
+    sm_request(WANT_AWAKE);
+    ESP_LOGI(TAG, "亮屏（刷新恢复 %dms；面板唤醒交给 pwr_sm）", (int)LV_DISP_DEF_REFR_PERIOD);
 }
 
 void power_screen_off(void)
@@ -273,8 +388,12 @@ void power_screen_off(void)
     poll_retime(true);
 
     s_screen_on = false;
-    ESP_LOGI(TAG, "息屏（背光关 + 面板 DISPOFF + 刷新放慢到 %dms + 轮询 %dms）",
-             POWER_REFR_OFF_MS, POWER_POLL_OFF_MS);
+
+    /* 更深一级（SLPIN，阻塞 100ms）交给状态机；功能关掉时它就什么都不做 */
+    sm_request(WANT_DEEP);
+    ESP_LOGI(TAG, "息屏（背光关 + 面板 DISPOFF + 刷新放慢到 %dms + 轮询 %dms%s）",
+             POWER_REFR_OFF_MS, POWER_POLL_OFF_MS,
+             s_deep_enabled ? " + 深睡交给 pwr_sm" : "；深睡已关");
 }
 
 bool power_screen_is_on(void)
@@ -460,10 +579,29 @@ esp_err_t power_init(void)
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_poll, POWER_POLL_MS * 1000),
                         TAG, "定时器启动失败");
 
+    /*
+     * ★ 1.5 档：面板深睡状态机任务。
+     *
+     *   栈给 6KB —— 它要调 `lv_refr_now()` **同步重画**（真正的绘制发生在这个任务里），
+     *   和 LVGL 任务（6KB）干的是同一件事，栈不能比它小。
+     *
+     *   优先级 3，**刻意低于 LVGL 任务的 4**：
+     *   触摸唤醒是在 LVGL 任务里（它那一刻**正持有 LVGL 锁**）调 `power_screen_on()` 的，
+     *   如果状态机优先级更高，就会在对方持锁时抢跑去抢锁 → 只能靠重试等锁；
+     *   低一级则等 LVGL 处理完当前帧、**释放锁之后**才执行唤醒序列，
+     *   同步重画一次就能拿到锁，也顺带避免 SLPIN 的 100ms 卡住界面刷新。
+     */
+    if (xTaskCreatePinnedToCore(pwr_sm_task, "pwr_sm", 6 * 1024, NULL, 3, &s_sm_task, tskNO_AFFINITY) != pdPASS) {
+        s_sm_task = NULL;
+        s_deep_enabled = false;     /* 没状态机就别指望深睡，退回第一档行为 */
+        ESP_LOGW(TAG, "面板状态机任务创建失败 → 面板深睡不可用（其余照常）");
+    }
+
     w_platform_set_screen_hooks(&s_hooks);
 
-    ESP_LOGI(TAG, "电源管理就绪（自动息屏 %d 秒；息屏=关背光+面板DISPOFF+停刷新+轮询%dms）",
-             timeout_sec(), POWER_POLL_OFF_MS);
+    ESP_LOGI(TAG, "电源管理就绪（自动息屏 %d 秒；息屏=关背光+面板DISPOFF+刷新放慢+轮询%dms%s）",
+             timeout_sec(), POWER_POLL_OFF_MS,
+             s_deep_enabled ? "+面板深睡 SLPIN" : "");
     return ESP_OK;
 }
 
@@ -479,6 +617,11 @@ void power_dump(void)
              s_refr_pending ? "（有一次待补做）" : "",
              (unsigned)s_poll_ms,
              s_screen_on ? "开" : "关(DISPOFF)");
+    /* ★ 1.5 档：面板深睡（SLPIN）状态 + 最近一次唤醒耗时（客观验证那 100ms 的代价） */
+    ESP_LOGI(TAG, "  面板深睡：功能=%s  当前=%s  最近一次唤醒耗时=%u ms（其中约 100ms 是驱动内部固定等待）",
+             s_deep_enabled ? "开" : "关",
+             s_act_deep ? "已 SLPIN" : "未睡",
+             (unsigned)s_last_wake_ms);
     /* ★ 电源自锁：电池供电的命门（SYS_EN=GPIO41，见 board.h）。
      *   拉高并回读为高 = 拔掉 USB 也能活着；为低 = 一拔线就断电。 */
     {

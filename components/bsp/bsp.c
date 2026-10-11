@@ -148,6 +148,18 @@ esp_err_t bsp_lcd_display(bool on)
     return esp_lcd_panel_disp_on_off(s_lcd_panel, on);
 }
 
+/**
+ * @brief 面板睡眠开关（SLPIN/SLPOUT）—— v0.7.2「1.5 档」；细节见 bsp.h 的说明
+ *
+ * @note ⚠️ 会阻塞约 100ms（IDF 驱动内部无条件 delay，SLPIN/SLPOUT 都一样）
+ *       ⇒ 只能从任务里调（本工程由 `power.c` 的 `pwr_sm` 任务调用）。
+ */
+esp_err_t bsp_lcd_sleep(bool sleep)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_panel, ESP_ERR_INVALID_STATE, TAG, "LCD 未初始化");
+    return esp_lcd_panel_disp_sleep(s_lcd_panel, sleep);   /* 内部 vTaskDelay(100) */
+}
+
 /* ==================== 触摸 ==================== */
 /**
  * @brief 触摸读取回调（LVGL 每次采样都会调）

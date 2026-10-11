@@ -87,6 +87,21 @@ int power_hold_count(void);
 /** @brief 打印状态（串口命令用） */
 void power_dump(void);
 
+/**
+ * @brief 面板深睡（SLPIN）运行时开关 —— v0.7.2「1.5 档」
+ *
+ * @param on true = 息屏后把面板送进 SLPIN（默认）；false = 退回第一档（只 DISPOFF）
+ *
+ * @note 存在意义有两个：① **测量**：同一块板、同一电量下开关各测一次息屏电流，
+ *       差值就是 SLPIN 的真实收益；② **回滚**：万一某批面板 SLPIN 后唤不回来，
+ *       一条串口命令就能退回，不必重烧固件。
+ * @note 关闭时会**立刻把面板唤醒**（不会把它留在睡眠里）。
+ */
+void power_deepsleep_set(bool on);
+
+/** @brief 面板深睡开关当前是否打开 */
+bool power_deepsleep_get(void);
+
 #ifdef __cplusplus
 }
 #endif

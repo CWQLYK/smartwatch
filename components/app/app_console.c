@@ -821,12 +821,12 @@ static int cmd_power(int argc, char **argv)
 
     if (strcmp(sub, "off") == 0) {
         power_screen_off();
-        printf("已息屏（背光关 + 面板 DISPOFF + 刷新放慢 + 轮询放慢；详见 power status）\n");
+        printf("已息屏（背光关+面板DISPOFF 立即生效；深睡 SLPIN 由 pwr_sm 完成，详见 power status）\n");
         return 0;
     }
     if (strcmp(sub, "on") == 0) {
         power_screen_on();
-        printf("已亮屏（面板 DISPON + 刷新恢复 + 整屏重画）\n");
+        printf("已亮屏（刷新恢复 + 整屏重画；面板 SLPOUT 由 pwr_sm 执行，约 125ms）\n");
         return 0;
     }
     if (strcmp(sub, "status") == 0) {
@@ -838,7 +838,24 @@ static int cmd_power(int argc, char **argv)
     if (strcmp(sub, "log") == 0) {
         return cmd_power_log(argc, argv);
     }
-    printf("可用: power on|off|status|log <start|stop|status|dump [all]|erase>\n");
+    if (strcmp(sub, "deepsleep") == 0) {
+        /* v0.7.2「1.5 档」面板深睡开关：测量（同电量 A/B）与回滚都用它 */
+        const char *a = (argc > 2) ? argv[2] : NULL;
+        if (a && strcmp(a, "on") == 0) {
+            power_deepsleep_set(true);
+            printf("面板深睡已开（息屏后进 SLPIN；唤醒会多约 100ms）\n");
+            return 0;
+        }
+        if (a && strcmp(a, "off") == 0) {
+            power_deepsleep_set(false);
+            printf("面板深睡已关（退回第一档：只 DISPOFF；面板已立刻唤醒）\n");
+            return 0;
+        }
+        printf("当前：面板深睡=%s\n  用法：power deepsleep on|off\n",
+               power_deepsleep_get() ? "开" : "关");
+        return 0;
+    }
+    printf("可用: power on|off|status|deepsleep on|off|log <start|stop|status|dump [all]|boot|hang|erase>\n");
     return 1;
 }
 
@@ -1124,7 +1141,7 @@ static void register_commands(void)
         { .command = "next",           .help = "翻到下一页（调试用）", .func = cmd_next },
         { .command = "pages",          .help = "当前页布局/滚动情况", .func = cmd_pages },
         { .command = "wifi",           .help = "WiFi: wifi on|status|scan|connect <SSID> [密码]|disconnect|forget|reset|sync", .func = cmd_wifi },
-        { .command = "power",          .help = "屏幕: power on|off|status|log <start|stop|status|dump [all]|erase>", .func = cmd_power },
+        { .command = "power",          .help = "屏幕: power on|off|status|deepsleep on|off|log <...>", .func = cmd_power },
         { .command = "rec",            .help = "IMU 录制: rec start|stop|status|list|get <文件>|erase", .func = cmd_rec },
         { .command = "imu_raw",        .help = "打印 IMU 原始码值: imu_raw [次数]", .func = cmd_imu_raw },
         { .command = "motion",         .help = "计步状态（步数/步频/信号强度）", .func = cmd_motion },

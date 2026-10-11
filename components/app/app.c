@@ -48,7 +48,7 @@ static const char *TAG = "APP";
  *   2. doc/version/vX.Y.Z.md（每个版本一个文档）
  *   3. doc/version/README.md 的版本列表
  */
-#define APP_VERSION_STR  "0.7.2"
+#define APP_VERSION_STR  "0.7.3"
 
 const char *app_version(void)
 {
