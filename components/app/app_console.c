@@ -19,6 +19,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_console.h"
+#include "esp_pm.h"        /* v0.7.4 第二档：pm 命令（esp_pm_dump_locks） */
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "driver/usb_serial_jtag.h"   /* ★ v0.7.1：usb_serial_jtag_is_connected()（无主机守卫用） */
@@ -1132,9 +1133,75 @@ static int cmd_crash(int argc, char **argv)
     return 0;   /* 不会走到这里 */
 }
 
+    /**
+ * @brief pm —— 看电源管理（DFS / light sleep）的当前状态（v0.7.4 第二档）
+ *
+ * 为什么需要它：**DFS 是"看不见"的** —— 从日志和界面上都看不出 CPU 有没有降频。
+ * `esp_pm_dump_locks()` 会打印「CPU frequency: N MHz」+ 当前持有的锁（含持锁者名字），
+ * 于是可以用它客观确认：
+ *   - 空闲时频率是否从 240MHz 降到了下限（说明 DFS 生效）；
+ *   - 插 USB 时 `usb_serial_jtag` 是否持有 NO_LIGHT_SLEEP 锁（说明 light sleep 被正确挡住，
+ *     控制台不会因为睡眠而断——这是 IDF 的 CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION 行为）。
+ *
+ * ⚠️ 没有开 PM 的固件里这个命令仍然可用，只是会提示未启用（避免命令表缺项）。
+ */
+/**
+ * @brief pm dfs on|off —— DFS 运行时开关（v0.7.4 第二档）
+ *
+ * 为什么需要：**DFS 是全局配置，不在日志里体现** —— 要判断"值不值得留着"，
+ * 只能同一块板、同一电量下开/关各测一次息屏电流。它同时也是回滚开关：
+ * 若发现降频带来任何异常（背光/蜂鸣器/时序），一条命令即可退回定频。
+ */
+static void pm_set_dfs(bool on)
+{
+#if CONFIG_PM_ENABLE
+    esp_pm_config_t cfg = {
+        .max_freq_mhz       = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz       = on ? 40 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .light_sleep_enable = false,
+    };
+    const esp_err_t e = esp_pm_configure(&cfg);
+    printf("DFS 已%s（min=%d MHz）%s\n", on ? "打开" : "关闭",
+           (int)cfg.min_freq_mhz, e == ESP_OK ? "" : "（配置失败）");
+#else
+    (void)on;
+    printf("本固件未启用 PM，无法切换 DFS\n");
+#endif
+}
+
+static int cmd_pm(int argc, char **argv)
+{
+    if (argc > 2 && strcmp(argv[1], "dfs") == 0) {
+        if (strcmp(argv[2], "on") == 0)  { pm_set_dfs(true);  return 0; }
+        if (strcmp(argv[2], "off") == 0) { pm_set_dfs(false); return 0; }
+        printf("用法：pm dfs on|off\n");
+        return 1;
+    }
+    (void)argc;
+    (void)argv;
+#if CONFIG_PM_ENABLE
+    esp_pm_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    printf("\n");
+    if (esp_pm_get_configuration(&cfg) == ESP_OK) {
+        printf("  PM 已启用：CPU 频率范围 %d~%d MHz，light sleep=%s\n",
+               (int)cfg.min_freq_mhz, (int)cfg.max_freq_mhz,
+               cfg.light_sleep_enable ? "开" : "关");
+    } else {
+        printf("  PM 已启用（但配置读取失败）\n");
+    }
+    printf("  当前 CPU 频率与 PM 锁：\n");
+    esp_pm_dump_locks(stdout);
+    printf("\n");
+#else
+    printf("\n  本固件未启用 PM（CONFIG_PM_ENABLE=n）：CPU 一直在默认频率，没有 DFS/light sleep\n\n");
+#endif
+    return 0;
+}
+
 static void register_commands(void)
 {
-    static const esp_console_cmd_t cmds[] = {
+static const esp_console_cmd_t cmds[] = {
         { .command = "time",           .help = "时间: time（看状态）/ time set <YYYY-MM-DD> <HH:MM:SS>（UTC校时）", .func = cmd_time },
         { .command = "set_time",       .help = "校时: set_time <YYYY-MM-DD> <HH:MM:SS> [utc]", .func = cmd_set_time },
         { .command = "battery",        .help = "打印电池电压（对照万用表）", .func = cmd_battery },
@@ -1154,6 +1221,8 @@ static void register_commands(void)
         /* v0.6.1 新增：运行时观测（taskmem 用来定各任务的栈大小） */
         { .command = "taskmem",        .help = "任务栈余量: taskmem [任务名]", .func = cmd_taskmem },
         { .command = "stats",          .help = "各任务 CPU 占用（采两次，间隔 1 秒）", .func = cmd_stats },
+        /* v0.7.4 第二档：电源管理（DFS/light sleep）状态 —— 确认降频真的生效 */
+        { .command = "pm",             .help = "电源管理：当前 CPU 频率 + PM 锁列表", .func = cmd_pm },
         { .command = "bt",             .help = "打印所有任务的调用栈（卡死时用）", .func = cmd_bt },
         /* ⚠️ 会让你重启，仅调试用 */
         { .command = "crash",          .help = "故意崩溃（验证 coredump 用，会复位）", .func = cmd_crash },

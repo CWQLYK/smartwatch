@@ -56,7 +56,13 @@ static esp_err_t backlight_init(void)
         .timer_num       = BL_LEDC_TIMER,
         .duty_resolution = BL_LEDC_RES,
         .freq_hz         = 5000,
-        .clk_cfg         = LEDC_AUTO_CLK,
+        /*
+         * ★ 第二档 DFS：必须用【晶振】当时钟源。
+         *   LEDC_AUTO_CLK 会跟着 APB 频率走，而 DFS 一降频（240→80MHz）背光亮度立刻漂；
+         *   晶振 40MHz 与 DFS 无关，亮度恒定。
+         *   ⚠️ LEDC 驱动自身**不加 PM 锁**（已核 IDF 源码），所以这一改是必须的，不是可选优化。
+         */
+        .clk_cfg         = LEDC_USE_XTAL_CLK,
     };
     ESP_RETURN_ON_ERROR(ledc_timer_config(&tcfg), TAG, "ledc timer");
 

@@ -148,3 +148,17 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 # ==================== Partition table ====================
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ==================== 电源管理（第二档省电，阶段 1：DFS） ====================
+# 实测息屏仍有 51mA，大头是"CPU 一直跑在 240MHz 双核"。
+# 阶段 1 只开 **动态调频（DFS）**：空闲时把 CPU 降到低频，有活干时自动升回来。
+#
+# ⚠️ 阶段 2（自动 light sleep）**不能**只加一行 CONFIG_FREERTOS_USE_TICKLESS_IDLE：
+#    IDF 在 tickless 打开后会**强制**启用 PM_SLP_DISABLE_GPIO（Kconfig 里是 select），
+#    于是 light sleep 期间**所有 GPIO 被隔离（含输出功能）** ——
+#    而本板的**电源自锁脚 SYS_EN(GPIO41) 正是靠输出高电平维持整机供电**，
+#    不先把它用 gpio_hold_en() 钉住，电池供电会在第一次 light sleep 时直接断电。
+#    同理，背光（LEDC 输出）与蜂鸣器在 light sleep 期间会停振 → 需要 NO_LIGHT_SLEEP 锁。
+#    这些都已记在 doc/智能手表-低功耗实施文档.md 的 §4.6（第二档方案）里。
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y

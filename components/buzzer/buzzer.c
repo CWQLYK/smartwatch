@@ -204,7 +204,9 @@ esp_err_t buzzer_init(void)
         .timer_num       = BZ_LEDC_TIMER,
         .duty_resolution = BZ_LEDC_RES,
         .freq_hz         = BZ_DEFAULT_FREQ,
-        .clk_cfg         = LEDC_AUTO_CLK,
+        /* ★ 第二档 DFS：同背光 —— 用晶振做时钟源，音调不受 CPU 降频影响
+         *   （`ledc_set_freq()` 是按"当前时钟"重算分频的，APB 一变音调就跑）*/
+        .clk_cfg         = LEDC_USE_XTAL_CLK,
     };
     ESP_RETURN_ON_ERROR(ledc_timer_config(&tcfg), TAG, "LEDC 定时器配置失败");
 
